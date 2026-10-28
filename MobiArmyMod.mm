@@ -159,6 +159,22 @@ static inline bool safe_read(void *dst, const void *src, size_t size) {
     return (kr == KERN_SUCCESS && bytesRead == size);
 }
 
+// ---------- Helper xả instruction cache bằng ASM thuần (Chống lỗi undefined symbol ___clear_cache) ----------
+static inline void flush_instruction_cache(void *addr, size_t size) {
+#if defined(__arm64__) || defined(__aarch64__)
+    uintptr_t start = (uintptr_t)addr;
+    uintptr_t end = start + size;
+    for (uintptr_t p = start & ~63ULL; p < end; p += 64) {
+        __asm__ volatile("dc cvau, %0" : : "r"(p) : "memory");
+    }
+    __asm__ volatile("dsb ish" : : : "memory");
+    for (uintptr_t p = start & ~63ULL; p < end; p += 64) {
+        __asm__ volatile("ic ivau, %0" : : "r"(p) : "memory");
+    }
+    __asm__ volatile("dsb ish\nisb" : : : "memory");
+#endif
+}
+
 // ---------- Helper ghi đè lệnh máy (Hard Patch Code Instructions trong __TEXT) ----------
 static bool patch_code_instruction(void *addr, uint32_t instruction) {
     if (!addr) return false;
@@ -175,7 +191,7 @@ static bool patch_code_instruction(void *addr, uint32_t instruction) {
     *(uint32_t *)addr = instruction;
 
     vm_protect(task, page_start, page_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
-    __builtin___clear_cache((char *)addr, (char *)addr + sizeof(uint32_t));
+    flush_instruction_cache(addr, sizeof(uint32_t));
     return true;
 }
 
@@ -196,7 +212,7 @@ static bool patch_code_bytes(void *addr, const void *bytes, size_t size) {
     memcpy(addr, bytes, size);
 
     vm_protect(task, page_start, page_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
-    __builtin___clear_cache((char *)addr, (char *)addr + size);
+    flush_instruction_cache(addr, size);
     return true;
 }
 
