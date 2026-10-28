@@ -22,10 +22,10 @@
 #import <mach/vm_page_size.h>
 
 #include <stdint.h>
+#include <stdbool.h>
 #include <string.h>
 #include <unistd.h>
-#include <cmath>
-#include <vector>
+#include <math.h>
 
 // ==========================================
 // CẤU HÌNH MẶC ĐỊNH
@@ -49,7 +49,7 @@ typedef struct MethodInfo {
     void *methodPointer;
     void *invoker_method;
     const char *name;
-    Il2CppClass *klass;
+    void *klass;
     const void *return_type;
     const void *parameters;
 } MethodInfo;
@@ -58,7 +58,6 @@ typedef struct Il2CppArray {
     Il2CppObject obj;
     void *bounds;
     uintptr_t max_length;
-    void *values[0];
 } Il2CppArray;
 
 // ---------- RVA trong UnityFramework 1.0.1.0.3 ----------
@@ -116,7 +115,7 @@ static volatile int g_installed = 0;
 // ==========================================
 // CẤU TRÚC DỮ LIỆU ĐỊCH & QUỸ ĐẠO BẮN
 // ==========================================
-struct EnemyTarget {
+typedef struct {
     int32_t id;
     int32_t x;
     int32_t y;
@@ -124,17 +123,20 @@ struct EnemyTarget {
     int8_t  team;
     float   distance;
     char    name[64];
-};
+} EnemyTarget;
 
-struct AimSolution {
+typedef struct {
     int16_t angle;
     int8_t  force;
     int8_t  force2;
     float   landingError;
     bool    found;
-};
+} AimSolution;
 
-static std::vector<EnemyTarget> g_enemyList;
+#define MAX_TARGETS 32
+static EnemyTarget g_enemyList[MAX_TARGETS];
+static int g_enemyCount = 0;
+
 static AimSolution g_lastSolution = { 45, 20, 0, 0.0f, false };
 static int32_t g_lastMyX = 0, g_lastMyY = 0;
 
@@ -267,7 +269,7 @@ static AimSolution calculateAim(int32_t x0, int32_t y0, int32_t x1, int32_t y1, 
 // 3. QUÉT BỘ NHỚ VỊ TRÍ ĐỊCH (RUNTIME SCANNER)
 // ==========================================
 static void updateTargetsFromMemory(void) {
-    g_enemyList.clear();
+    g_enemyCount = 0;
 
     if (!p_GetMyPlayer || !battle_manager_class) return;
 
@@ -301,7 +303,7 @@ static void updateTargetsFromMemory(void) {
         int32_t pid = *(int32_t *)((uintptr_t)p + OFF_PLAYER_ID);
 
         // Chỉ nhắm vào kẻ địch (khác team) và còn sống (hp > 0)
-        if (team != myTeam && hp > 0) {
+        if (team != myTeam && hp > 0 && g_enemyCount < MAX_TARGETS) {
             EnemyTarget enemy;
             enemy.id = pid;
             enemy.x = px;
@@ -312,22 +314,22 @@ static void updateTargetsFromMemory(void) {
             float dy = (float)(py - g_lastMyY);
             enemy.distance = sqrtf(dx * dx + dy * dy);
             snprintf(enemy.name, sizeof(enemy.name), "Địch #%d (HP:%d)", pid, hp);
-            g_enemyList.push_back(enemy);
+            g_enemyList[g_enemyCount++] = enemy;
         }
     }
 
-    if (g_enemyList.empty()) {
+    if (g_enemyCount == 0) {
         g_lastSolution.found = false;
         return;
     }
 
     // Đảm bảo target index hợp lệ
-    if (g_currentTargetIdx >= (int)g_enemyList.size()) {
+    if (g_currentTargetIdx >= g_enemyCount) {
         g_currentTargetIdx = 0;
     }
 
-    EnemyTarget &target = g_enemyList[g_currentTargetIdx];
-    g_lastSolution = calculateAim(g_lastMyX, g_lastMyY, target.x, target.y, g_gravityFactor, g_forceScale, g_highArcMode);
+    EnemyTarget *target = &g_enemyList[g_currentTargetIdx];
+    g_lastSolution = calculateAim(g_lastMyX, g_lastMyY, target->x, target->y, g_gravityFactor, g_forceScale, g_highArcMode);
 }
 
 // ==========================================
@@ -583,14 +585,14 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
 }
 
 - (void)onPrevTarget {
-    if (g_enemyList.empty()) return;
-    g_currentTargetIdx = (g_currentTargetIdx - 1 + (int)g_enemyList.size()) % (int)g_enemyList.size();
+    if (g_enemyCount == 0) return;
+    g_currentTargetIdx = (g_currentTargetIdx - 1 + g_enemyCount) % g_enemyCount;
     [self onTimerTick];
 }
 
 - (void)onNextTarget {
-    if (g_enemyList.empty()) return;
-    g_currentTargetIdx = (g_currentTargetIdx + 1) % (int)g_enemyList.size();
+    if (g_enemyCount == 0) return;
+    g_currentTargetIdx = (g_currentTargetIdx + 1) % g_enemyCount;
     [self onTimerTick];
 }
 
@@ -609,26 +611,26 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
 - (void)onTimerTick {
     updateTargetsFromMemory();
 
-    if (g_enemyList.empty()) {
+    if (g_enemyCount == 0) {
         self.targetInfoLabel.text = @"Chưa vào trận hoặc không có địch";
         self.aimInfoLabel.text = @"Góc: --°  |  Lực: --";
         self.statusLabel.text = @"Vào trận để tự động quét toạ độ địch";
         return;
     }
 
-    if (g_currentTargetIdx >= (int)g_enemyList.size()) {
+    if (g_currentTargetIdx >= g_enemyCount) {
         g_currentTargetIdx = 0;
     }
 
-    EnemyTarget &target = g_enemyList[g_currentTargetIdx];
-    self.targetInfoLabel.text = [NSString stringWithFormat:@"[%d/%lu] %s", g_currentTargetIdx + 1, g_enemyList.size(), target.name];
+    EnemyTarget *target = &g_enemyList[g_currentTargetIdx];
+    self.targetInfoLabel.text = [NSString stringWithFormat:@"[%d/%d] %s", g_currentTargetIdx + 1, g_enemyCount, target->name];
 
     if (g_lastSolution.found) {
         self.aimInfoLabel.text = [NSString stringWithFormat:@"🎯 Góc: %d°  |  Lực: %d", g_lastSolution.angle, g_lastSolution.force];
-        self.statusLabel.text = [NSString stringWithFormat:@"Khoảng cách: %.0f px (dX: %d, dY: %d)", target.distance, (target.x - g_lastMyX), (g_lastMyY - target.y)];
+        self.statusLabel.text = [NSString stringWithFormat:@"Khoảng cách: %.0f px (dX: %d, dY: %d)", target->distance, (target->x - g_lastMyX), (g_lastMyY - target->y)];
     } else {
         self.aimInfoLabel.text = @"Không tìm được góc trúng!";
-        self.statusLabel.text = [NSString stringWithFormat:@"Mục tiêu ngoài tầm bắn (%.0f px)", target.distance];
+        self.statusLabel.text = [NSString stringWithFormat:@"Mục tiêu ngoài tầm bắn (%.0f px)", target->distance];
     }
 }
 

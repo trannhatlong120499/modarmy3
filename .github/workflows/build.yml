@@ -30,7 +30,7 @@ jobs:
           set -e
           export PATH="$THEOS/bin:$PATH"
           make clean || true
-          make FINALPACKAGE=1
+          make FINALPACKAGE=1 messages=yes
 
       - name: Show output
         run: |
