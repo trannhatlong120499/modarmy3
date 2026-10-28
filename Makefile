@@ -7,6 +7,6 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = MobiArmyMod
 MobiArmyMod_FILES = MobiArmyMod.mm
 MobiArmyMod_FRAMEWORKS = Foundation UIKit CoreGraphics QuartzCore
-MobiArmyMod_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
+MobiArmyMod_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-variable -Wno-unused-function
 
 include $(THEOS_MAKE_PATH)/tweak.mk

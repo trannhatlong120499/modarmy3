@@ -29,7 +29,6 @@
 // CẤU HÌNH MẶC ĐỊNH
 // ==========================================
 static float g_zoomFactor       = 1.50f;    // Mức zoom mặc định (1.5x)
-static BOOL  g_globalZoom       = YES;      // Zoom toàn cảnh
 static BOOL  g_aimbotEnabled    = YES;      // Bật aimbot
 static BOOL  g_highArcMode      = YES;      // YES: Góc cao (High Arc), NO: Góc thấp (Low Arc)
 static float g_gravityFactor    = 1.0f;     // Hệ số trọng lực tinh chỉnh
