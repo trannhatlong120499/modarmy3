@@ -1,9 +1,9 @@
 //
 //  MobiArmyMod.mm
-//  MobiArmy 3 HA Mod Dylib - Thu Nhỏ Map & Auto-Aim Chuẩn Xác 100% Zero Crash
+//  MobiArmy 3 HA Mod Dylib - Auto-Aim Chuẩn Xác & Zero Crash 100%
 //
 //  Tương thích: TrollStore / TrollFools / Dopamine / Sileo / Rootless / Rootful
-//  Kiến trúc: ARM64 + ARM64E (iOS 14.0 - 18.x)
+//  Kiến trúc: ARM64 + ARM64E (Hỗ trợ từ iPhone X tới iPhone 16 Pro Max, iOS 14.0 - 18.x)
 //
 
 #import <Foundation/Foundation.h>
@@ -16,7 +16,6 @@
 // ==========================================
 // CẤU HÌNH MẶC ĐỊNH
 // ==========================================
-static float g_zoomFactor       = 2.00f;    // Mức zoom mặc định (2.0x mở rộng bản đồ cực nét)
 static BOOL  g_aimbotEnabled    = YES;      // Bật aimbot
 static BOOL  g_highArcMode      = YES;      // YES: Góc cao (High Arc), NO: Góc thấp (Low Arc)
 static float g_gravityFactor    = 1.0f;     // Hệ số trọng lực tinh chỉnh
@@ -27,24 +26,6 @@ static int   g_currentTargetIdx = 0;        // Index mục tiêu hiện tại
 #define OFF_SERVICE_SEND_SHOOT          0x148704
 #define OFF_BATTLE_MANAGER_CLASS        0x3bb9190
 #define OFF_GAMECONTROLLER_CLASS        0x3bb92d0
-#define OFF_GAMECANVAS_CLASS            0x3bb90a0
-#define OFF_SCALE_CLASS                 0x3bb9230
-#define OFF_CONFIG_SCALE_CLASS          0x3bb8fd0
-#define OFF_USER_SESSION_CLASS          0x3bb9340
-
-// Native C++ functions của Unity engine
-#define RVA_NATIVE_SCREEN_GET_WIDTH      0x2b360e4
-#define RVA_NATIVE_SCREEN_GET_HEIGHT     0x2b360f8
-#define RVA_NATIVE_GL_LOAD_MATRIX        0x2b364f0
-#define RVA_NATIVE_INTERNAL_DRAW_TEXTURE 0x2b36280
-#define RVA_NATIVE_GUICLIP_SET_MATRIX    0x23f1aa4
-
-// Cached Icall Slots trong phân vùng __DATA.__bss
-#define OFF_ICALL_SCREEN_GET_WIDTH       0x4084f08
-#define OFF_ICALL_SCREEN_GET_HEIGHT      0x4084f10
-#define OFF_ICALL_INTERNAL_DRAW_TEXTURE  0x4084f50
-#define OFF_ICALL_GL_LOAD_MATRIX         0x4084f98
-#define OFF_ICALL_GUICLIP_SET_MATRIX     0x40868b0
 
 // Offsets của thực thể Player (Khớp chính xác 100% với metadata dump.cs 1.0.1.0.3)
 #define OFF_PLAYER_IS_ME        0x10   // Boolean (1 byte)
@@ -57,49 +38,11 @@ static int   g_currentTargetIdx = 0;        // Index mục tiêu hiện tại
 #define OFF_PLAYER_CUR_X        0x280  // Single (float, 4 bytes)
 #define OFF_PLAYER_CUR_Y        0x284  // Single (float, 4 bytes)
 
-// Call-site + 4 của renderer map (Screen.get_width/height)
-static const uintptr_t kWidthSites[]  = { 0x194188, 0x194868, 0x194a98 };
-static const uintptr_t kHeightSites[] = { 0x194194, 0x194874, 0x194aa4 };
-
-// Unity 4x4 Matrix cho GUIClip (64 bytes)
-typedef struct {
-    float m[16];
-} UnityMatrix4x4;
-
-// Unity Rect struct (16 bytes)
-typedef struct {
-    float x;
-    float y;
-    float width;
-    float height;
-} UnityRect;
-
-// UnityEngine.Internal_DrawTextureArguments
-typedef struct {
-    UnityRect screenRect; // Offset 0x00
-    UnityRect sourceRect; // Offset 0x10
-    int32_t leftBorder;
-    int32_t rightBorder;
-    int32_t topBorder;
-    int32_t bottomBorder;
-} Internal_DrawTextureArguments;
-
 static BOOL g_isInBattle = NO;
-
-// Function Pointers & Counters
 static uintptr_t unity_base = 0;
-static BOOL g_hooksInstalled = NO;
 static uint64_t g_battleUpdateCount = 0;
 
 static void (*orig_SendShoot)(void *self, int8_t shootType, int16_t angle, int16_t x, int16_t y, int8_t force, int8_t force2, int8_t unk, void *method) = NULL;
-
-// Native engine functions & Zoom variables
-static void (*real_GLLoadPixelMatrixScript)(float left, float right, float bottom, float top) = NULL;
-static void (*real_Internal_DrawTexture)(void *args) = NULL;
-static void (*real_GUIClip_SetMatrix)(UnityMatrix4x4 *mat) = NULL;
-
-static int32_t s_baseCanvasW = 0;
-static int32_t s_baseCanvasH = 0;
 
 // ==========================================
 // CẤU TRÚC DỮ LIỆU ĐỊCH & QUỸ ĐẠO BẮN
@@ -145,20 +88,6 @@ static inline bool safe_read(void *dst, const void *src, size_t size) {
     return (kr == KERN_SUCCESS && bytesRead == size);
 }
 
-// ---------- Helper ghi bộ nhớ an toàn (với vm_protect) ----------
-static inline bool safe_write(void *dst, const void *src, size_t size) {
-    if (!dst || !src || size == 0) return false;
-    uintptr_t p = clean_ptr((uintptr_t)dst);
-    if (p < 0x100000000ULL || p > 0x00007FFFFFFFFFFFULL) return false;
-
-    vm_address_t page = (vm_address_t)(p & ~((uintptr_t)(vm_page_size - 1)));
-    vm_size_t pageSize = (vm_size_t)vm_page_size;
-    vm_protect(mach_task_self(), page, pageSize, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-
-    memcpy((void *)p, src, size);
-    return true;
-}
-
 // ---------- Helper tìm base UnityFramework (Dùng dlsym + dladdr chuẩn xác 100%) ----------
 static uintptr_t find_unity_base(void) {
     if (unity_base) return unity_base;
@@ -190,223 +119,7 @@ static uintptr_t find_unity_base(void) {
 }
 
 // ==========================================
-// 1. CƠ CHẾ ZOOM MAP TOÀN DIỆN & ZERO CRASH (RAM-ONLY)
-// ==========================================
-
-// Hook 1: Graphics.Internal_DrawTexture (Thu nhỏ mọi sprite: nhân vật, đảo bay, cây cỏ, đạn)
-static void my_Internal_DrawTexture(void *args) {
-    if (!args || !real_Internal_DrawTexture) {
-        if (real_Internal_DrawTexture && args) real_Internal_DrawTexture(args);
-        return;
-    }
-
-    if (g_zoomFactor > 1.05f) {
-        Internal_DrawTextureArguments *drawArgs = (Internal_DrawTextureArguments *)args;
-        UnityRect origRect = drawArgs->screenRect;
-
-        float extraScale = 1.0f / g_zoomFactor;
-        drawArgs->screenRect.x *= extraScale;
-        drawArgs->screenRect.y *= extraScale;
-        drawArgs->screenRect.width *= extraScale;
-        drawArgs->screenRect.height *= extraScale;
-
-        real_Internal_DrawTexture(args);
-
-        drawArgs->screenRect = origRect;
-        return;
-    }
-
-    real_Internal_DrawTexture(args);
-}
-
-// Hook 2: GUIClip.SetMatrix (Thu nhỏ ma trận 2D clip view)
-static void my_GUIClip_SetMatrix(UnityMatrix4x4 *mat) {
-    if (mat && g_zoomFactor > 1.05f) {
-        UnityMatrix4x4 scaled = *mat;
-        float extraScale = 1.0f / g_zoomFactor;
-        scaled.m[0] *= extraScale;
-        scaled.m[5] *= extraScale;
-        if (real_GUIClip_SetMatrix) {
-            real_GUIClip_SetMatrix(&scaled);
-            return;
-        }
-    }
-    if (real_GUIClip_SetMatrix) {
-        real_GUIClip_SetMatrix(mat);
-    }
-}
-
-// Hook 3: GL.LoadPixelMatrix (Mở rộng vùng viewport pixel)
-static void my_icall_GLLoadPixelMatrixScript(float left, float right, float bottom, float top) {
-    if (g_zoomFactor > 1.05f) {
-        right = left + (right - left) * g_zoomFactor;
-        bottom = top + (bottom - top) * g_zoomFactor;
-    }
-    if (real_GLLoadPixelMatrixScript) {
-        real_GLLoadPixelMatrixScript(left, right, bottom, top);
-    }
-}
-
-// Hook 4: Screen.width / Screen.height (Chỉ scale khi được gọi từ renderer map)
-static inline bool matches_call_site(uintptr_t ra, const uintptr_t *sites, size_t n) {
-    if (!unity_base) return false;
-    for (size_t i = 0; i < n; i++) {
-        if (ra == unity_base + sites[i]) return true;
-    }
-    return false;
-}
-
-static int my_icall_Screen_get_width(void) {
-    int w = 0;
-    if (unity_base) {
-        safe_read(&w, (const void *)(unity_base + 0x3b4ff40), sizeof(w));
-    }
-    if (w <= 0) {
-        if ([NSThread isMainThread]) {
-            CGSize sz = [UIScreen mainScreen].bounds.size;
-            CGFloat scale = [UIScreen mainScreen].scale;
-            w = (int)(MAX(sz.width, sz.height) * (scale > 0 ? scale : 2.0));
-        }
-    }
-    if (w <= 0) w = 1024;
-
-    if (g_zoomFactor > 1.05f) {
-        uintptr_t ra = (uintptr_t)__builtin_return_address(0);
-        if (matches_call_site(ra, kWidthSites, sizeof(kWidthSites) / sizeof(kWidthSites[0]))) {
-            return (int)(w * g_zoomFactor);
-        }
-    }
-    return w;
-}
-
-static int my_icall_Screen_get_height(void) {
-    int h = 0;
-    if (unity_base) {
-        safe_read(&h, (const void *)(unity_base + 0x3b4ff44), sizeof(h));
-    }
-    if (h <= 0) {
-        if ([NSThread isMainThread]) {
-            CGSize sz = [UIScreen mainScreen].bounds.size;
-            CGFloat scale = [UIScreen mainScreen].scale;
-            h = (int)(MIN(sz.width, sz.height) * (scale > 0 ? scale : 2.0));
-        }
-    }
-    if (h <= 0) h = 600;
-
-    if (g_zoomFactor > 1.05f) {
-        uintptr_t ra = (uintptr_t)__builtin_return_address(0);
-        if (matches_call_site(ra, kHeightSites, sizeof(kHeightSites) / sizeof(kHeightSites[0]))) {
-            return (int)(h * g_zoomFactor);
-        }
-    }
-    return h;
-}
-
-// Cập nhật kích thước GameCanvas (w, h, hw, hh) trực tiếp trong RAM để camera/culling mở rộng
-static void update_gamecanvas_dimensions(uintptr_t base) {
-    if (!base) return;
-
-    @try {
-        uintptr_t canvasClass = 0;
-        if (!safe_read(&canvasClass, (const void *)(base + OFF_GAMECANVAS_CLASS), sizeof(uintptr_t))) return;
-        canvasClass = clean_ptr(canvasClass);
-        if (canvasClass < 0x100000000ULL || (canvasClass & 1)) return;
-
-        uintptr_t staticFields = 0;
-        if (!safe_read(&staticFields, (const void *)(canvasClass + 0xA0), sizeof(uintptr_t))) return;
-        staticFields = clean_ptr(staticFields);
-        if (staticFields < 0x100000000ULL) return;
-
-        int32_t curW = 0, curH = 0;
-        safe_read(&curW, (const void *)(staticFields + 0x48), sizeof(int32_t));
-        safe_read(&curH, (const void *)(staticFields + 0x4C), sizeof(int32_t));
-
-        if (s_baseCanvasW == 0) {
-            if (curW >= 320 && curW <= 4000) {
-                s_baseCanvasW = curW;
-                s_baseCanvasH = curH;
-            } else {
-                s_baseCanvasW = 1024;
-                s_baseCanvasH = 600;
-            }
-        }
-
-        if (s_baseCanvasW > 0) {
-            float zoomMul = (g_zoomFactor >= 1.05f) ? g_zoomFactor : 1.0f;
-            int32_t targetW = (int32_t)(s_baseCanvasW * zoomMul);
-            int32_t targetH = (int32_t)(s_baseCanvasH * zoomMul);
-
-            *(int32_t *)(staticFields + 0x48) = targetW;
-            *(int32_t *)(staticFields + 0x4C) = targetH;
-            *(int32_t *)(staticFields + 0x54) = targetW / 2;
-            *(int32_t *)(staticFields + 0x50) = targetH / 2;
-        }
-    } @catch (id ex) {}
-}
-
-// Cập nhật hệ số scale gốc của mGraphics (0x3bb9230 + 0x18) và Config (0x3bb8fd0 + 0x8)
-static void update_graphics_scale(uintptr_t base) {
-    if (!base) return;
-
-    @try {
-        int32_t targetScale = (g_zoomFactor >= 1.4f) ? 1 : 2;
-
-        // 1. Cập nhật mGraphics class (0x3bb9230)
-        uintptr_t scaleClass = 0;
-        if (safe_read(&scaleClass, (const void *)(base + OFF_SCALE_CLASS), sizeof(uintptr_t))) {
-            scaleClass = clean_ptr(scaleClass);
-            if (scaleClass >= 0x100000000ULL && (scaleClass & 1) == 0) {
-                uintptr_t staticFields = 0;
-                if (safe_read(&staticFields, (const void *)(scaleClass + 0xA0), sizeof(uintptr_t))) {
-                    staticFields = clean_ptr(staticFields);
-                    if (staticFields >= 0x100000000ULL) {
-                        *(int32_t *)(staticFields + 0x18) = targetScale;
-                    }
-                }
-            }
-        }
-
-        // 2. Cập nhật Config Scale class (0x3bb8fd0)
-        uintptr_t configClass = 0;
-        if (safe_read(&configClass, (const void *)(base + OFF_CONFIG_SCALE_CLASS), sizeof(uintptr_t))) {
-            configClass = clean_ptr(configClass);
-            if (configClass >= 0x100000000ULL && (configClass & 1) == 0) {
-                uintptr_t cfgStatic = 0;
-                if (safe_read(&cfgStatic, (const void *)(configClass + 0xA0), sizeof(uintptr_t))) {
-                    cfgStatic = clean_ptr(cfgStatic);
-                    if (cfgStatic >= 0x100000000ULL) {
-                        *(int32_t *)(cfgStatic + 8) = targetScale;
-                    }
-                }
-            }
-        }
-    } @catch (id ex) {}
-}
-
-static void apply_icall_zoom_hooks(uintptr_t base) {
-    if (!base) return;
-
-    @try {
-        real_GLLoadPixelMatrixScript = (void (*)(float, float, float, float))(base + RVA_NATIVE_GL_LOAD_MATRIX);
-        real_Internal_DrawTexture = (void (*)(void *))(base + RVA_NATIVE_INTERNAL_DRAW_TEXTURE);
-        real_GUIClip_SetMatrix = (void (*)(UnityMatrix4x4 *))(base + RVA_NATIVE_GUICLIP_SET_MATRIX);
-
-        uintptr_t fn_w = (uintptr_t)my_icall_Screen_get_width;
-        uintptr_t fn_h = (uintptr_t)my_icall_Screen_get_height;
-        uintptr_t fn_dt = (uintptr_t)my_Internal_DrawTexture;
-        uintptr_t fn_gl = (uintptr_t)my_icall_GLLoadPixelMatrixScript;
-        uintptr_t fn_mat = (uintptr_t)my_GUIClip_SetMatrix;
-
-        safe_write((void *)(base + OFF_ICALL_SCREEN_GET_WIDTH), &fn_w, sizeof(fn_w));
-        safe_write((void *)(base + OFF_ICALL_SCREEN_GET_HEIGHT), &fn_h, sizeof(fn_h));
-        safe_write((void *)(base + OFF_ICALL_INTERNAL_DRAW_TEXTURE), &fn_dt, sizeof(fn_dt));
-        safe_write((void *)(base + OFF_ICALL_GL_LOAD_MATRIX), &fn_gl, sizeof(fn_gl));
-        safe_write((void *)(base + OFF_ICALL_GUICLIP_SET_MATRIX), &fn_mat, sizeof(fn_mat));
-    } @catch (id ex) {}
-}
-
-// ==========================================
-// 2. THUẬT TOÁN TÍNH ĐẠN ĐẠO (BALLISTICS)
+// 1. THUẬT TOÁN TÍNH ĐẠN ĐẠO (BALLISTICS)
 // ==========================================
 static AimSolution calculateAim(int32_t x0, int32_t y0, int32_t x1, int32_t y1, float gravityScale, float forceScale, bool highArc) {
     AimSolution sol = { 45, 20, 0, 99999.0f, false };
@@ -488,7 +201,7 @@ static void updateAimSolution(void) {
 }
 
 // ==========================================
-// 3. QUÉT TRẬN ĐẤU CHUẨN XÁC 100% (ZERO CRASH - SAFE READ ONLY)
+// 2. QUÉT TRẬN ĐẤU CHUẨN XÁC 100% (ZERO CRASH - SAFE READ ONLY)
 // ==========================================
 static void scanBattleState(void) {
     if (!unity_base) {
@@ -734,7 +447,7 @@ static void scanBattleState(void) {
 }
 
 // ==========================================
-// 4. HOOK BẮN (SEND SHOOT)
+// 3. HOOK BẮN (SEND SHOOT)
 // ==========================================
 static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t x, int16_t y, int8_t force, int8_t force2, int8_t unk, void *method) {
     @try {
@@ -752,7 +465,7 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
 }
 
 // ==========================================
-// 5. GIAO DIỆN ĐIỀU KHIỂN (UI HUD)
+// 4. GIAO DIỆN ĐIỀU KHIỂN (UI HUD)
 // ==========================================
 @interface MobiHUDManager : NSObject
 @property (nonatomic, strong) UIWindow *window;
@@ -761,7 +474,6 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) UILabel *targetInfoLabel;
 @property (nonatomic, strong) UILabel *aimInfoLabel;
-@property (nonatomic, strong) UISegmentedControl *zoomSegment;
 @property (nonatomic, strong) UISwitch *aimSwitch;
 @property (nonatomic, strong) UISegmentedControl *arcSegment;
 @property (nonatomic, strong) UISlider *gravitySlider;
@@ -773,7 +485,6 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
 + (instancetype)shared;
 - (void)attachToKeyWindow;
 - (void)refreshUI;
-- (void)backgroundSync;
 @end
 
 @implementation MobiHUDManager
@@ -841,9 +552,9 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
     [self.floatingButton addGestureRecognizer:pan];
     [parent addSubview:self.floatingButton];
 
-    // Panel điều khiển
+    // Panel điều khiển (gọn gàng, tối ưu không gian)
     CGFloat panelW = 310;
-    CGFloat panelH = 340;
+    CGFloat panelH = 280;
     self.panelView = [[UIView alloc] initWithFrame:CGRectMake((parent.bounds.size.width - panelW) / 2, (parent.bounds.size.height - panelH) / 2, panelW, panelH)];
     self.panelView.backgroundColor = [UIColor colorWithRed:0.08 green:0.11 blue:0.16 alpha:0.95];
     self.panelView.layer.cornerRadius = 14;
@@ -859,7 +570,7 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
 
     // Tiêu đề
     UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, curY, panelW - 56, 24)];
-    titleLabel.text = @"⚡ MOBIARMY 3 HA MOD";
+    titleLabel.text = @"⚡ MOBIARMY 3 HA AIMBOT";
     titleLabel.font = [UIFont boldSystemFontOfSize:15];
     titleLabel.textColor = [UIColor colorWithRed:0.3 green:0.8 blue:1.0 alpha:1.0];
     [self.panelView addSubview:titleLabel];
@@ -871,28 +582,12 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
     closeBtn.titleLabel.font = [UIFont boldSystemFontOfSize:18];
     [closeBtn addTarget:self action:@selector(togglePanel) forControlEvents:UIControlEventTouchUpInside];
     [self.panelView addSubview:closeBtn];
-    curY += 28;
-
-    // Zoom Segment
-    UILabel *zoomTitle = [[UILabel alloc] initWithFrame:CGRectMake(16, curY, panelW - 32, 18)];
-    zoomTitle.text = @"MỨC ZOOM BẢN ĐỒ:";
-    zoomTitle.font = [UIFont systemFontOfSize:11 weight:UIFontWeightMedium];
-    zoomTitle.textColor = [UIColor colorWithWhite:0.75 alpha:1.0];
-    [self.panelView addSubview:zoomTitle];
-    curY += 18;
-
-    NSArray *zoomItems = @[@"1.0x", @"1.5x", @"2.0x", @"3.0x", @"4.0x"];
-    self.zoomSegment = [[UISegmentedControl alloc] initWithItems:zoomItems];
-    self.zoomSegment.frame = CGRectMake(16, curY, panelW - 32, 28);
-    self.zoomSegment.selectedSegmentIndex = 2; // Mặc định 2.0x
-    [self.zoomSegment addTarget:self action:@selector(onZoomChanged:) forControlEvents:UIControlEventValueChanged];
-    [self.panelView addSubview:self.zoomSegment];
-    curY += 36;
+    curY += 32;
 
     // Aimbot Switch
     UILabel *aimTitle = [[UILabel alloc] initWithFrame:CGRectMake(16, curY + 4, 150, 24)];
     aimTitle.text = @"AIMBOT TỰ ĐỘNG";
-    aimTitle.font = [UIFont boldSystemFontOfSize:12];
+    aimTitle.font = [UIFont boldSystemFontOfSize:13];
     aimTitle.textColor = [UIColor whiteColor];
     [self.panelView addSubview:aimTitle];
 
@@ -905,11 +600,11 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
     // Arc Mode Segment
     NSArray *arcItems = @[@"Góc cao (High Arc)", @"Góc thấp (Low Arc)"];
     self.arcSegment = [[UISegmentedControl alloc] initWithItems:arcItems];
-    self.arcSegment.frame = CGRectMake(16, curY, panelW - 32, 26);
+    self.arcSegment.frame = CGRectMake(16, curY, panelW - 32, 28);
     self.arcSegment.selectedSegmentIndex = g_highArcMode ? 0 : 1;
     [self.arcSegment addTarget:self action:@selector(onArcChanged:) forControlEvents:UIControlEventValueChanged];
     [self.panelView addSubview:self.arcSegment];
-    curY += 32;
+    curY += 34;
 
     // Target Info & Switch
     self.targetInfoLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, curY, panelW - 130, 24)];
@@ -1026,22 +721,6 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
     }
 }
 
-- (void)onZoomChanged:(UISegmentedControl *)sender {
-    @try {
-        float values[] = { 1.0f, 1.5f, 2.0f, 3.0f, 4.0f };
-        if (sender.selectedSegmentIndex >= 0 && sender.selectedSegmentIndex < 5) {
-            g_zoomFactor = values[sender.selectedSegmentIndex];
-        }
-        if (unity_base) {
-            update_gamecanvas_dimensions(unity_base);
-            update_graphics_scale(unity_base);
-        }
-        [self refreshUI];
-    } @catch (id ex) {
-        NSLog(@"[MobiArmyMod] Lỗi onZoomChanged: %@", ex);
-    }
-}
-
 - (void)onAimToggle:(UISwitch *)sender {
     g_aimbotEnabled = sender.isOn;
     [self refreshUI];
@@ -1078,30 +757,16 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
     [self refreshUI];
 }
 
-- (void)backgroundSync {
-    if (unity_base) {
-        update_gamecanvas_dimensions(unity_base);
-        update_graphics_scale(unity_base);
-    }
-}
-
 - (void)refreshUI {
     @try {
-        if (!unity_base) {
-            unity_base = find_unity_base();
-            if (!unity_base) return;
-        }
-
-        update_gamecanvas_dimensions(unity_base);
-        update_graphics_scale(unity_base);
-
         scanBattleState();
 
         if (!g_isInBattle) {
             self.targetInfoLabel.text = @"Chưa vào trận đấu";
             self.targetInfoLabel.textColor = [UIColor yellowColor];
             self.aimInfoLabel.text = @"Góc: --°  |  Lực: --";
-            self.statusLabel.text = [NSString stringWithFormat:@"Zoom: %.1fx (Bật) | Sẵn sàng...", g_zoomFactor];
+            self.aimInfoLabel.textColor = [UIColor colorWithWhite:0.6 alpha:1.0];
+            self.statusLabel.text = @"Vào trận để tự động quét mục tiêu";
             return;
         }
 
@@ -1109,6 +774,7 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
             self.targetInfoLabel.text = @"Đang tìm địch...";
             self.targetInfoLabel.textColor = [UIColor yellowColor];
             self.aimInfoLabel.text = @"Góc: --°  |  Lực: --";
+            self.aimInfoLabel.textColor = [UIColor colorWithWhite:0.6 alpha:1.0];
             self.statusLabel.text = [NSString stringWithFormat:@"Ta: (%d, %d) | Chờ mục tiêu...", g_lastMyX, g_lastMyY];
             return;
         }
@@ -1123,8 +789,8 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
         if (g_lastSolution.found) {
             self.aimInfoLabel.text = [NSString stringWithFormat:@"Góc: %d°  |  Lực: %d", g_lastSolution.angle, g_lastSolution.force];
             self.aimInfoLabel.textColor = [UIColor colorWithRed:0.2 green:1.0 blue:0.5 alpha:1.0];
-            self.statusLabel.text = [NSString stringWithFormat:@"Ta: (%d, %d) | Cách: %d px", 
-                g_lastMyX, g_lastMyY, abs(curEnemy->x - g_lastMyX)];
+            self.statusLabel.text = [NSString stringWithFormat:@"Ta: (%d, %d) | Cách: %d px | HP: %d", 
+                g_lastMyX, g_lastMyY, abs(curEnemy->x - g_lastMyX), curEnemy->hp];
         } else {
             self.aimInfoLabel.text = @"Góc: --°  |  Lực: --";
             self.aimInfoLabel.textColor = [UIColor colorWithWhite:0.6 alpha:1.0];
@@ -1139,58 +805,48 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
 @end
 
 // ==========================================
-// 6. KHỞI TẠO HOOKS & CONSTRUCTOR
+// 5. KHỞI TẠO HOOKS & CONSTRUCTOR AN TOÀN
 // ==========================================
-static void install_hooks(void) {
+static void setupHUDAndHooks(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         uintptr_t base = find_unity_base();
-        if (!base) return;
-        unity_base = base;
+        if (base) {
+            unity_base = base;
+            NSLog(@"[MobiArmyMod] UnityFramework base: 0x%lx", base);
 
-        NSLog(@"[MobiArmyMod] Bắt đầu cài đặt Mod an toàn vào UnityFramework (0x%lx)...", base);
-
-        // 1. Cài đặt hooks icall slots an toàn trong __DATA.__bss
-        apply_icall_zoom_hooks(base);
-
-        // 2. Đồng bộ scale và kích thước canvas ban đầu
-        update_gamecanvas_dimensions(base);
-        update_graphics_scale(base);
-
-        // 3. Hook qua MSHookFunction nếu có Substrate/Ellekit (Dopamine / Sileo)
-        void (*fn_MSHook)(void *, void *, void **) = (void (*)(void *, void *, void **))dlsym(RTLD_DEFAULT, "MSHookFunction");
-        if (fn_MSHook) {
-            fn_MSHook((void *)(base + OFF_SERVICE_SEND_SHOOT), (void *)hook_SendShoot, (void **)&orig_SendShoot);
-            NSLog(@"[MobiArmyMod] MSHookFunction đã cài đặt hooks SendShoot!");
+            // Hook qua MSHookFunction nếu có Substrate/Ellekit (Dopamine / Sileo)
+            void (*fn_MSHook)(void *, void *, void **) = (void (*)(void *, void *, void **))dlsym(RTLD_DEFAULT, "MSHookFunction");
+            if (fn_MSHook) {
+                fn_MSHook((void *)(base + OFF_SERVICE_SEND_SHOOT), (void *)hook_SendShoot, (void **)&orig_SendShoot);
+                NSLog(@"[MobiArmyMod] MSHookFunction đã cài đặt hook SendShoot!");
+            }
         }
 
-        // 4. Bật timer định kỳ 0.5s để giữ đồng bộ scale và kích thước canvas ổn định
-        [NSTimer scheduledTimerWithTimeInterval:0.5
-                                         target:[MobiHUDManager shared]
-                                       selector:@selector(backgroundSync)
-                                       userInfo:nil
-                                        repeats:YES];
-
-        g_hooksInstalled = YES;
-        NSLog(@"[MobiArmyMod] HOÀN TẤT KHỞI TẠO MOD THÀNH CÔNG 100%%!");
+        [[MobiHUDManager shared] attachToKeyWindow];
+        NSLog(@"[MobiArmyMod] Khởi tạo HUD thành công 100%%!");
     });
 }
 
 __attribute__((constructor)) static void MobiArmyModInit(void) {
     NSLog(@"[MobiArmyMod] Dylib khởi chạy trong tiến trình pid: %d", getpid());
 
-    // Tuyệt đối không can thiệp bộ nhớ hoặc gọi hàm engine ở constructor!
+    // Tuyệt đối không can thiệp bộ nhớ engine ở constructor!
     // Chờ app vào foreground hoàn toàn trên main thread
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if ([UIApplication sharedApplication].applicationState == UIApplicationStateActive) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                setupHUDAndHooks();
+            });
+        }
+    });
+
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
                                                        object:nil
                                                         queue:[NSOperationQueue mainQueue]
                                                    usingBlock:^(NSNotification * _Nonnull note) {
-        static dispatch_once_t onceToken;
-        dispatch_once(&onceToken, ^{
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                install_hooks();
-                [[MobiHUDManager shared] attachToKeyWindow];
-            });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            setupHUDAndHooks();
         });
     }];
 }
