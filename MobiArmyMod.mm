@@ -635,8 +635,8 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
 
     UIButton *nextTargetBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     nextTargetBtn.frame = CGRectMake(panelW - 76, curY, 60, 28);
-    nextTargetBtn.setTitle:@"Tiếp ▶" forState:UIControlStateNormal];
-    nextTargetBtn.setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [nextTargetBtn setTitle:@"Tiếp ▶" forState:UIControlStateNormal];
+    [nextTargetBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     nextTargetBtn.titleLabel.font = [UIFont systemFontOfSize:12];
     nextTargetBtn.backgroundColor = [UIColor colorWithWhite:0.25 alpha:0.8];
     nextTargetBtn.layer.cornerRadius = 6;
