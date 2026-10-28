@@ -23,7 +23,7 @@
 // ==========================================
 // CẤU HÌNH MẶC ĐỊNH
 // ==========================================
-static float g_zoomFactor       = 1.5f;     // Mức zoom mặc định (1.2x - 2.0x)
+static float g_zoomFactor       = 1.35f;    // Mức zoom mặc định (1.2x - 2.0x)
 static BOOL  g_globalZoom       = YES;      // Zoom toàn cảnh
 static BOOL  g_aimbotEnabled    = YES;      // Bật aimbot
 static BOOL  g_highArcMode      = YES;      // YES: Góc cao (High Arc), NO: Góc thấp (Low Arc)
@@ -34,10 +34,12 @@ static int   g_currentTargetIdx = 0;        // Index mục tiêu hiện tại
 // RVAs trong UnityFramework 1.0.1.0.3
 #define OFF_SCREEN_GET_WIDTH            0x1a81aa0
 #define OFF_SCREEN_GET_HEIGHT           0x1a81ae0
+#define OFF_SCREEN_SET_RESOLUTION       0x1a81fbc
 #define OFF_GL_LOAD_PIXEL_MATRIX        0x1a830e4
 #define OFF_SERVICE_SEND_SHOOT          0x148704
 #define OFF_PLAYER_UPDATE               0x9f244
 #define OFF_BATTLE_UPDATE               0x297090
+#define OFF_BATTLE_GET_MY_PLAYER        0x295fac
 
 // Offsets của thực thể Player (Khớp chính xác 100% với metadata dump.cs 1.0.1.0.3)
 #define OFF_PLAYER_IS_ME        0x10   // Boolean (1 byte)
@@ -52,12 +54,18 @@ static int   g_currentTargetIdx = 0;        // Index mục tiêu hiện tại
 
 // Function Pointers
 static uintptr_t unity_base = 0;
+static BOOL g_hooksInstalled = NO;
+static uint64_t g_playerUpdateCount = 0;
+static uint64_t g_battleUpdateCount = 0;
+
 static int (*orig_get_width)(void) = NULL;
 static int (*orig_get_height)(void) = NULL;
+static void (*orig_SetResolution)(int width, int height, bool fullscreen, void *method) = NULL;
 static void (*orig_LoadPixelMatrix)(float left, float right, float bottom, float top, void *method) = NULL;
 static void (*orig_SendShoot)(void *self, int8_t shootType, int16_t angle, int16_t x, int16_t y, int8_t force, int8_t force2, int8_t unk, void *method) = NULL;
 static void (*orig_PlayerUpdate)(void *self, void *method) = NULL;
 static void (*orig_BattleUpdate)(void *self, void *method) = NULL;
+static void *(*orig_GetMyPlayer)(void *method) = NULL;
 
 // ==========================================
 // CẤU TRÚC DỮ LIỆU ĐỊCH & QUỸ ĐẠO BẮN
@@ -99,11 +107,14 @@ static inline bool safe_read(void *dst, const void *src, size_t size) {
 
 // ---------- Helper tìm base UnityFramework ----------
 static uintptr_t find_unity_base(void) {
+    if (unity_base) return unity_base;
     uint32_t count = _dyld_image_count();
     for (uint32_t i = 0; i < count; i++) {
         const char *name = _dyld_get_image_name(i);
         if (name && strstr(name, "UnityFramework")) {
-            return (uintptr_t)_dyld_get_image_header(i);
+            unity_base = (uintptr_t)_dyld_get_image_header(i);
+            NSLog(@"[MobiArmyMod] Đã tìm thấy UnityFramework tại 0x%lx (image %d: %s)", unity_base, i, name);
+            return unity_base;
         }
     }
     return 0;
@@ -128,8 +139,7 @@ static inline bool is_map_renderer_call(uintptr_t ra) {
 // ==========================================
 static int hook_get_width(void) {
     int w = orig_get_width ? orig_get_width() : 0;
-    uintptr_t ra = (uintptr_t)__builtin_return_address(0);
-    if (is_map_renderer_call(ra)) {
+    if (g_zoomFactor > 1.01f) {
         return (int)(w * g_zoomFactor);
     }
     return w;
@@ -137,20 +147,29 @@ static int hook_get_width(void) {
 
 static int hook_get_height(void) {
     int h = orig_get_height ? orig_get_height() : 0;
-    uintptr_t ra = (uintptr_t)__builtin_return_address(0);
-    if (is_map_renderer_call(ra)) {
+    if (g_zoomFactor > 1.01f) {
         return (int)(h * g_zoomFactor);
     }
     return h;
 }
 
+// Hook Screen.SetResolution (0x1a81fbc) để patch cứng độ phân giải ngay từ đầu
+static void hook_SetResolution(int width, int height, bool fullscreen, void *method) {
+    NSLog(@"[MobiZoom] Screen.SetResolution gốc: %d x %d (fullscreen: %d)", width, height, fullscreen);
+    if (g_zoomFactor > 1.01f) {
+        width = (int)(width * g_zoomFactor);
+        height = (int)(height * g_zoomFactor);
+        NSLog(@"[MobiZoom] -> Patch cứng độ phân giải: %d x %d (zoom %.2fx)", width, height, g_zoomFactor);
+    }
+    if (orig_SetResolution) {
+        orig_SetResolution(width, height, fullscreen, method);
+    }
+}
+
 static void hook_LoadPixelMatrix(float left, float right, float bottom, float top, void *method) {
     if (g_zoomFactor > 1.01f) {
-        uintptr_t ra = (uintptr_t)__builtin_return_address(0);
-        if (is_map_renderer_call(ra)) {
-            right *= g_zoomFactor;
-            bottom *= g_zoomFactor;
-        }
+        right *= g_zoomFactor;
+        bottom *= g_zoomFactor;
     }
     if (orig_LoadPixelMatrix) {
         orig_LoadPixelMatrix(left, right, bottom, top, method);
@@ -241,6 +260,7 @@ static void updateAimSolution(void) {
 static void hook_PlayerUpdate(void *self, void *method) {
     if (self && (uintptr_t)self >= 0x100000000ULL) {
         g_lastPlayerUpdateTime = mach_absolute_time();
+        g_playerUpdateCount++;
 
         uint8_t isMe = 0;
         safe_read(&isMe, (const void *)((uintptr_t)self + OFF_PLAYER_IS_ME), sizeof(uint8_t));
@@ -329,10 +349,43 @@ static void hook_PlayerUpdate(void *self, void *method) {
 static void hook_BattleUpdate(void *self, void *method) {
     if (self) {
         g_lastPlayerUpdateTime = mach_absolute_time();
+        g_battleUpdateCount++;
     }
     if (orig_BattleUpdate) {
         orig_BattleUpdate(self, method);
     }
+}
+
+// Hook GetMyPlayer để lập tức lấy toạ độ Player khi vào trận
+static void *hook_GetMyPlayer(void *method) {
+    void *player = orig_GetMyPlayer ? orig_GetMyPlayer(method) : NULL;
+    if (player && (uintptr_t)player >= 0x100000000ULL) {
+        g_lastPlayerUpdateTime = mach_absolute_time();
+        g_battleUpdateCount++;
+        g_myPlayer = player;
+
+        int32_t px = 0, py = 0;
+        int8_t team = 0;
+        safe_read(&px, (const void *)((uintptr_t)player + OFF_PLAYER_X), sizeof(int32_t));
+        safe_read(&py, (const void *)((uintptr_t)player + OFF_PLAYER_Y), sizeof(int32_t));
+        safe_read(&team, (const void *)((uintptr_t)player + OFF_PLAYER_TEAM), sizeof(int8_t));
+
+        if (px == 0 && py == 0) {
+            float fx = 0, fy = 0;
+            safe_read(&fx, (const void *)((uintptr_t)player + OFF_PLAYER_CUR_X), sizeof(float));
+            safe_read(&fy, (const void *)((uintptr_t)player + OFF_PLAYER_CUR_Y), sizeof(float));
+            if (fx != 0 || fy != 0) {
+                px = (int32_t)fx;
+                py = (int32_t)fy;
+            }
+        }
+        if (px != 0 || py != 0) {
+            g_lastMyX = px;
+            g_lastMyY = py;
+            g_myTeam = team;
+        }
+    }
+    return player;
 }
 
 // ==========================================
@@ -659,18 +712,25 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
 }
 
 - (void)refreshUI {
+    if (!g_hooksInstalled) {
+        self.targetInfoLabel.text = @"Đang nạp hook...";
+        self.aimInfoLabel.text = @"Góc: --°  |  Lực: --";
+        self.statusLabel.text = [NSString stringWithFormat:@"Base: 0x%lx", unity_base];
+        return;
+    }
+
     static mach_timebase_info_data_t s_timebase;
     if (s_timebase.denom == 0) mach_timebase_info(&s_timebase);
 
     uint64_t elapsedNs = (g_lastPlayerUpdateTime > 0) ? (mach_absolute_time() - g_lastPlayerUpdateTime) * s_timebase.numer / s_timebase.denom : 99999999999ULL;
-    BOOL inBattle = (g_lastPlayerUpdateTime > 0 && elapsedNs < 5000000000ULL); // Cập nhật trong vòng 5.0 giây
+    BOOL inBattle = (g_lastPlayerUpdateTime > 0 && elapsedNs < 6000000000ULL); // Cập nhật trong vòng 6.0 giây
 
     if (!inBattle) {
         g_enemyCount = 0;
         g_myPlayer = NULL;
         self.targetInfoLabel.text = @"Chưa vào trận đấu";
         self.aimInfoLabel.text = @"Góc: --°  |  Lực: --";
-        self.statusLabel.text = @"Vào trận để tự động quét địch";
+        self.statusLabel.text = [NSString stringWithFormat:@"Vào trận để quét (P:%llu B:%llu)", g_playerUpdateCount, g_battleUpdateCount];
         return;
     }
 
@@ -683,7 +743,7 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
             self.targetInfoLabel.text = @"Đã vào trận (Chờ quét địch)";
         }
         self.aimInfoLabel.text = @"Góc: --°  |  Lực: --";
-        self.statusLabel.text = @"Đang quét vị trí đối thủ...";
+        self.statusLabel.text = [NSString stringWithFormat:@"Đang quét địch... (P:%llu B:%llu)", g_playerUpdateCount, g_battleUpdateCount];
         return;
     }
 
@@ -696,10 +756,10 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
 
     if (g_lastSolution.found) {
         self.aimInfoLabel.text = [NSString stringWithFormat:@"🎯 Góc: %d°  |  Lực: %d", g_lastSolution.angle, g_lastSolution.force];
-        self.statusLabel.text = [NSString stringWithFormat:@"Khoảng cách: %.0f px", target->distance];
+        self.statusLabel.text = [NSString stringWithFormat:@"K.Cách: %.0f px | HP: %d (P:%llu)", target->distance, target->hp, g_playerUpdateCount];
     } else {
         self.aimInfoLabel.text = @"Không tìm được góc trúng!";
-        self.statusLabel.text = [NSString stringWithFormat:@"Ngoài tầm bắn (%.0f px)", target->distance];
+        self.statusLabel.text = [NSString stringWithFormat:@"Ngoài tầm (%.0f px) (P:%llu)", target->distance, g_playerUpdateCount];
     }
 }
 
@@ -709,50 +769,71 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
 // 6. KHỞI TẠO HOOKS AN TOÀN
 // ==========================================
 static void install_hooks(void) {
-    uintptr_t base = find_unity_base();
-    if (!base) return;
-    unity_base = base;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        uintptr_t base = find_unity_base();
+        if (!base) {
+            NSLog(@"[MobiArmyMod] Lỗi: Chưa tìm thấy base của UnityFramework!");
+            return;
+        }
+        unity_base = base;
 
-    // 1. Hook Screen.get_width & get_height
-    MSHookFunction((void *)(base + OFF_SCREEN_GET_WIDTH), (void *)hook_get_width, (void **)&orig_get_width);
-    MSHookFunction((void *)(base + OFF_SCREEN_GET_HEIGHT), (void *)hook_get_height, (void **)&orig_get_height);
+        NSLog(@"[MobiArmyMod] Bắt đầu cài đặt toàn bộ hooks vào UnityFramework (0x%lx)...", base);
 
-    // 2. Hook GL.LoadPixelMatrix (0x1a830e4)
-    MSHookFunction((void *)(base + OFF_GL_LOAD_PIXEL_MATRIX), (void *)hook_LoadPixelMatrix, (void **)&orig_LoadPixelMatrix);
+        // 1. Hook Screen.get_width & get_height
+        MSHookFunction((void *)(base + OFF_SCREEN_GET_WIDTH), (void *)hook_get_width, (void **)&orig_get_width);
+        MSHookFunction((void *)(base + OFF_SCREEN_GET_HEIGHT), (void *)hook_get_height, (void **)&orig_get_height);
 
-    // 3. Hook SendShoot để auto-aim
-    MSHookFunction((void *)(base + OFF_SERVICE_SEND_SHOOT), (void *)hook_SendShoot, (void **)&orig_SendShoot);
+        // 2. Hook Screen.SetResolution (0x1a81fbc) để patch cứng zoom ngay khi game khởi động!
+        MSHookFunction((void *)(base + OFF_SCREEN_SET_RESOLUTION), (void *)hook_SetResolution, (void **)&orig_SetResolution);
 
-    // 4. Hook Player.Update (0x9f244) để tự động bắt toạ độ Player & Địch realtime 100%
-    MSHookFunction((void *)(base + OFF_PLAYER_UPDATE), (void *)hook_PlayerUpdate, (void **)&orig_PlayerUpdate);
+        // 3. Hook GL.LoadPixelMatrix (0x1a830e4)
+        MSHookFunction((void *)(base + OFF_GL_LOAD_PIXEL_MATRIX), (void *)hook_LoadPixelMatrix, (void **)&orig_LoadPixelMatrix);
 
-    // 5. Hook BattleManager.Update (0x297090) để nhận biết trận đấu bắt đầu
-    MSHookFunction((void *)(base + OFF_BATTLE_UPDATE), (void *)hook_BattleUpdate, (void **)&orig_BattleUpdate);
+        // 4. Hook SendShoot để auto-aim
+        MSHookFunction((void *)(base + OFF_SERVICE_SEND_SHOOT), (void *)hook_SendShoot, (void **)&orig_SendShoot);
 
-    NSLog(@"[MobiArmyMod] MSHookFunction installed successfully on Player.Update, Battle.Update, Screen & SendShoot!");
+        // 5. Hook Player.Update (0x9f244) để tự động bắt toạ độ Player & Địch realtime 100%
+        MSHookFunction((void *)(base + OFF_PLAYER_UPDATE), (void *)hook_PlayerUpdate, (void **)&orig_PlayerUpdate);
+
+        // 6. Hook BattleManager.Update (0x297090) để nhận biết trận đấu bắt đầu
+        MSHookFunction((void *)(base + OFF_BATTLE_UPDATE), (void *)hook_BattleUpdate, (void **)&orig_BattleUpdate);
+
+        // 7. Hook BattleManager.GetMyPlayer (0x295fac)
+        MSHookFunction((void *)(base + OFF_BATTLE_GET_MY_PLAYER), (void *)hook_GetMyPlayer, (void **)&orig_GetMyPlayer);
+
+        g_hooksInstalled = YES;
+        NSLog(@"[MobiArmyMod] TẤT CẢ HOOK ĐÃ ĐƯỢC CÀI ĐẶT THÀNH CÔNG 100%!");
+    });
 }
 
 __attribute__((constructor)) static void MobiArmyModInit(void) {
-    // Chờ UnityFramework load xong để hook function
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
-        for (int i = 0; i < 60; i++) {
-            if (find_unity_base()) {
-                install_hooks();
-                break;
-            }
-            usleep(200000); // 0.2s
-        }
-    });
+    NSLog(@"[MobiArmyMod] Dylib khởi chạy trong tiến trình pid: %d", getpid());
 
-    // Lắng nghe thông báo khi App đã sẵn sàng để gắn UI an toàn
+    // Thử cài hook ngay lập tức nếu UnityFramework đã load sẵn (trước khi game chạy Awake/Start)
+    if (find_unity_base()) {
+        install_hooks();
+    } else {
+        // Nếu chưa load, poll nhanh mỗi 20ms trong thread ưu tiên cao
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+            for (int i = 0; i < 500; i++) {
+                if (find_unity_base()) {
+                    install_hooks();
+                    break;
+                }
+                usleep(20000); // 20ms
+            }
+        });
+    }
+
+    // Gắn UI sau khi app active
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(NSNotification * _Nonnull note) {
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
-            // Delay 3 giây để Unity khởi tạo xong view chính
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 [[MobiHUDManager shared] attachToKeyWindow];
             });
         });
