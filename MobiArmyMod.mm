@@ -803,7 +803,7 @@ static void install_hooks(void) {
         MSHookFunction((void *)(base + OFF_BATTLE_GET_MY_PLAYER), (void *)hook_GetMyPlayer, (void **)&orig_GetMyPlayer);
 
         g_hooksInstalled = YES;
-        NSLog(@"[MobiArmyMod] TẤT CẢ HOOK ĐÃ ĐƯỢC CÀI ĐẶT THÀNH CÔNG 100%!");
+        NSLog(@"[MobiArmyMod] TẤT CẢ HOOK ĐÃ ĐƯỢC CÀI ĐẶT THÀNH CÔNG (100%%)!");
     });
 }
 
