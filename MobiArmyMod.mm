@@ -33,17 +33,18 @@ static int   g_currentTargetIdx = 0;        // Index mục tiêu hiện tại
 #define OFF_ASSEMBLY_GET_IMAGE          0x1e66e80
 #define OFF_IMAGE_GET_NAME              0x1e67c20
 #define OFF_CLASS_FROM_NAME             0x1e66eb8
-#define OFF_IL2CPP_ADD_INTERNAL_CALL    0x2b2adf4
-
-// Biến Screen Width/Height toàn cục của Unity Engine (Trong __DATA)
-#define OFF_GLOBAL_SCREEN_WIDTH         0x3b4ff40
-#define OFF_GLOBAL_SCREEN_HEIGHT        0x3b4ff44
 
 // Native C++ functions của Unity engine (RVAs tĩnh trong binary)
 #define RVA_NATIVE_SCREEN_GET_WIDTH      0x2b360e4
 #define RVA_NATIVE_SCREEN_GET_HEIGHT     0x2b360f8
 #define RVA_NATIVE_GL_LOAD_MATRIX        0x2b364f0
 #define RVA_NATIVE_SCREEN_SET_RESOLUTION 0x2b361e4
+
+// Cached Icall Slots trong phân vùng __DATA.__bss (Ghi đè trực tiếp an toàn tuyệt đối)
+#define OFF_ICALL_SCREEN_GET_WIDTH       0x4084f08
+#define OFF_ICALL_SCREEN_GET_HEIGHT      0x4084f10
+#define OFF_ICALL_SCREEN_SET_RESOLUTION  0x4084f48
+#define OFF_ICALL_GL_LOAD_MATRIX         0x4084f98
 
 // Offsets của thực thể Player (Khớp chính xác 100% với metadata dump.cs 1.0.1.0.3)
 #define OFF_PLAYER_IS_ME        0x10   // Boolean (1 byte)
@@ -122,7 +123,7 @@ static inline uintptr_t clean_ptr(uintptr_t p) {
 // ---------- Helper đọc bộ nhớ an toàn (Chống Crash EXC_BAD_ACCESS 100%) ----------
 static inline bool safe_read(void *dst, const void *src, size_t size) {
     uintptr_t p = clean_ptr((uintptr_t)src);
-    if (p < 0x100000000ULL || p > 0x3000000000ULL) return false;
+    if (p < 0x100000000ULL || p > 0x00007FFFFFFFFFFFULL) return false;
     vm_size_t bytesRead = 0;
     kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t)p, size, (vm_address_t)dst, &bytesRead);
     return (kr == KERN_SUCCESS && bytesRead == size);
@@ -147,15 +148,19 @@ static uintptr_t find_unity_base(void) {
 // 1. CƠ CHẾ ZOOM MAP TOÀN DIỆN & MẠNH MẼ (1.0x - 5.0x)
 // ==========================================
 static int my_icall_Screen_get_width(void) {
-    int w = 1024;
-    if (real_Screen_get_width_icall) {
-        w = real_Screen_get_width_icall();
+    int w = 0;
+    if (unity_base) {
+        safe_read(&w, (const void *)(unity_base + 0x3b4ff40), sizeof(w));
     }
     if (w <= 0) {
-        CGSize sz = [UIScreen mainScreen].bounds.size;
-        CGFloat scale = [UIScreen mainScreen].scale;
-        w = (int)(MAX(sz.width, sz.height) * scale);
+        if ([NSThread isMainThread]) {
+            CGSize sz = [UIScreen mainScreen].bounds.size;
+            CGFloat scale = [UIScreen mainScreen].scale;
+            w = (int)(MAX(sz.width, sz.height) * (scale > 0 ? scale : 2.0));
+        }
     }
+    if (w <= 0) w = 1024;
+
     if (g_zoomFactor > 1.01f) {
         return (int)(w * g_zoomFactor);
     }
@@ -163,15 +168,19 @@ static int my_icall_Screen_get_width(void) {
 }
 
 static int my_icall_Screen_get_height(void) {
-    int h = 600;
-    if (real_Screen_get_height_icall) {
-        h = real_Screen_get_height_icall();
+    int h = 0;
+    if (unity_base) {
+        safe_read(&h, (const void *)(unity_base + 0x3b4ff44), sizeof(h));
     }
     if (h <= 0) {
-        CGSize sz = [UIScreen mainScreen].bounds.size;
-        CGFloat scale = [UIScreen mainScreen].scale;
-        h = (int)(MIN(sz.width, sz.height) * scale);
+        if ([NSThread isMainThread]) {
+            CGSize sz = [UIScreen mainScreen].bounds.size;
+            CGFloat scale = [UIScreen mainScreen].scale;
+            h = (int)(MIN(sz.width, sz.height) * (scale > 0 ? scale : 2.0));
+        }
     }
+    if (h <= 0) h = 600;
+
     if (g_zoomFactor > 1.01f) {
         return (int)(h * g_zoomFactor);
     }
@@ -198,43 +207,27 @@ static void my_icall_Screen_SetResolution(int width, int height, int fullscreenM
     NSLog(@"[MobiArmyMod] SetResolution gọi với %d x %d -> Phóng to: %d x %d (zoom: %.1fx)",
           width, height, targetW, targetH, g_zoomFactor);
 
-    if (unity_base) {
-        *(int32_t *)(unity_base + OFF_GLOBAL_SCREEN_WIDTH)  = targetW;
-        *(int32_t *)(unity_base + OFF_GLOBAL_SCREEN_HEIGHT) = targetH;
-    }
-
-    if (real_Screen_SetResolution) {
+    if (real_Screen_SetResolution && refreshRate) {
         real_Screen_SetResolution(targetW, targetH, fullscreenMode, refreshRate);
     }
 }
 
-static void apply_zoom_resolution(uintptr_t base, float zoom) {
+static void apply_icall_zoom_hooks(uintptr_t base) {
     if (!base) return;
-    int targetW = (int)(1024 * zoom);
-    int targetH = (int)(600 * zoom);
 
     @try {
-        // 1. Cập nhật trực tiếp 2 biến global Screen.width & Screen.height của Unity Engine (__DATA)
-        *(int32_t *)(base + OFF_GLOBAL_SCREEN_WIDTH)  = targetW;
-        *(int32_t *)(base + OFF_GLOBAL_SCREEN_HEIGHT) = targetH;
+        real_GLLoadPixelMatrixScript = (void (*)(float, float, float, float))(base + RVA_NATIVE_GL_LOAD_MATRIX);
+        real_Screen_SetResolution = (void (*)(int, int, int, const void *))(base + RVA_NATIVE_SCREEN_SET_RESOLUTION);
 
-        // 2. Gọi hàm native SetResolution của Unity Engine để cập nhật buffer render live
-        if (real_Screen_SetResolution) {
-            real_Screen_SetResolution(targetW, targetH, 0, NULL);
-        }
+        // Ghi đè con trỏ trong phân vùng __DATA.__bss sang hàm zoom của chúng ta
+        *(uintptr_t *)(base + OFF_ICALL_SCREEN_GET_WIDTH)       = (uintptr_t)my_icall_Screen_get_width;
+        *(uintptr_t *)(base + OFF_ICALL_SCREEN_GET_HEIGHT)      = (uintptr_t)my_icall_Screen_get_height;
+        *(uintptr_t *)(base + OFF_ICALL_SCREEN_SET_RESOLUTION)  = (uintptr_t)my_icall_Screen_SetResolution;
+        *(uintptr_t *)(base + OFF_ICALL_GL_LOAD_MATRIX)         = (uintptr_t)my_icall_GLLoadPixelMatrixScript;
 
-        // 3. Đăng ký lại icall qua il2cpp_add_internal_call
-        void (*fn_add_icall)(const char *, const void *) = (void (*)(const char *, const void *))(base + OFF_IL2CPP_ADD_INTERNAL_CALL);
-        if (fn_add_icall) {
-            fn_add_icall("UnityEngine.Screen::get_width", (void *)my_icall_Screen_get_width);
-            fn_add_icall("UnityEngine.Screen::get_height", (void *)my_icall_Screen_get_height);
-            fn_add_icall("UnityEngine.Screen::SetResolution_Injected", (void *)my_icall_Screen_SetResolution);
-            fn_add_icall("UnityEngine.GL::GLLoadPixelMatrixScript", (void *)my_icall_GLLoadPixelMatrixScript);
-        }
-
-        NSLog(@"[MobiArmyMod] Đã áp dụng zoom %.1fx: %d x %d (Native Variables + Icalls OK)", zoom, targetW, targetH);
+        NSLog(@"[MobiArmyMod] Đã gán icall zoom hooks (width, height, SetResolution, matrix) zoom=%.2fx", g_zoomFactor);
     } @catch (id ex) {
-        NSLog(@"[MobiArmyMod] Lỗi apply_zoom_resolution: %@", ex);
+        NSLog(@"[MobiArmyMod] Lỗi apply_icall_zoom_hooks: %@", ex);
     }
 }
 
@@ -337,7 +330,7 @@ static uintptr_t resolve_battle_manager_class(uintptr_t base) {
     // Cách 1: Đọc trực tiếp con trỏ tại OFF_BATTLE_MANAGER_CLASS (0x3bb9190) nếu đã được game khởi tạo
     uintptr_t tokenPtr = 0;
     if (safe_read(&tokenPtr, (const void *)(base + OFF_BATTLE_MANAGER_CLASS), sizeof(uintptr_t))) {
-        if (tokenPtr >= 0x100000000ULL && tokenPtr < 0x3000000000ULL) {
+        if (tokenPtr >= 0x100000000ULL && tokenPtr <= 0x00007FFFFFFFFFFFULL) {
             s_battleClass = (Il2CppClass *)tokenPtr;
             return (uintptr_t)s_battleClass;
         }
@@ -401,27 +394,31 @@ static void scanBattleState(void) {
         // Đọc static_fields (offset 0xA0 của Il2CppClass - kiểm chứng từ disassembly 0x295fac)
         uintptr_t staticFields = 0;
         if (!safe_read(&staticFields, (const void *)(classPtr + 0xA0), sizeof(uintptr_t)) ||
-            staticFields < 0x100000000ULL) {
+            staticFields < 0x100000000ULL || staticFields > 0x00007FFFFFFFFFFFULL) {
             s_debugScanState = 4;
             g_myPlayer = NULL;
             g_enemyCount = 0;
             return;
         }
 
-        // Quét tìm mảng playerArray trong staticFields tại các offset 0x8, 0x0, 0x10, 0x18, 0x20
+        // Quét tìm mảng playerArray trong staticFields tại các offset 0x8, 0x0, 0x10, 0x18, 0x20, 0x28, 0x30
         uintptr_t playerArray = 0;
         int32_t count = 0;
-        size_t candidateOffsets[] = { 0x8, 0x0, 0x10, 0x18, 0x20 };
-        for (int c = 0; c < 5; c++) {
+        size_t candidateOffsets[] = { 0x8, 0x0, 0x10, 0x18, 0x20, 0x28, 0x30 };
+        for (int c = 0; c < 7; c++) {
             uintptr_t cand = 0;
             if (safe_read(&cand, (const void *)(staticFields + candidateOffsets[c]), sizeof(uintptr_t)) &&
-                cand >= 0x100000000ULL && cand < 0x3000000000ULL) {
+                cand >= 0x100000000ULL && cand <= 0x00007FFFFFFFFFFFULL) {
                 int32_t testCount = 0;
                 if (safe_read(&testCount, (const void *)(cand + 0x18), sizeof(int32_t)) &&
                     testCount >= 1 && testCount <= 16) {
-                    playerArray = cand;
-                    count = testCount;
-                    break;
+                    uintptr_t testPlayer = 0;
+                    if (safe_read(&testPlayer, (const void *)(cand + 0x20), sizeof(uintptr_t)) &&
+                        testPlayer >= 0x100000000ULL && testPlayer <= 0x00007FFFFFFFFFFFULL) {
+                        playerArray = cand;
+                        count = testCount;
+                        break;
+                    }
                 }
             }
         }
@@ -835,8 +832,9 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
         if (sender.selectedSegmentIndex >= 0 && sender.selectedSegmentIndex < 5) {
             g_zoomFactor = values[sender.selectedSegmentIndex];
         }
-        if (unity_base) {
-            apply_zoom_resolution(unity_base, g_zoomFactor);
+        if (real_Screen_SetResolution) {
+            uint64_t dummyRefresh = 0x100000000ULL;
+            real_Screen_SetResolution((int)(1024 * g_zoomFactor), (int)(600 * g_zoomFactor), 3, &dummyRefresh);
         }
         [self refreshUI];
     } @catch (id ex) {
@@ -951,13 +949,8 @@ static void install_hooks(void) {
 
         NSLog(@"[MobiArmyMod] Bắt đầu cài đặt Hooks vào UnityFramework (0x%lx)...", base);
 
-        // 1. Áp dụng hook zoom & SetResolution ngay lập tức
-        real_Screen_get_width_icall = (int (*)(void))(base + RVA_NATIVE_SCREEN_GET_WIDTH);
-        real_Screen_get_height_icall = (int (*)(void))(base + RVA_NATIVE_SCREEN_GET_HEIGHT);
-        real_GLLoadPixelMatrixScript = (void (*)(float, float, float, float))(base + RVA_NATIVE_GL_LOAD_MATRIX);
-        real_Screen_SetResolution = (void (*)(int, int, int, const void *))(base + RVA_NATIVE_SCREEN_SET_RESOLUTION);
-
-        apply_zoom_resolution(base, g_zoomFactor);
+        // 1. Áp dụng hook zoom Icall slots trong __DATA.__bss
+        apply_icall_zoom_hooks(base);
 
         // 2. Khởi tạo IL2CPP metadata APIs
         init_il2cpp_api(base);
@@ -966,11 +959,7 @@ static void install_hooks(void) {
         void (*fn_MSHook)(void *, void *, void **) = (void (*)(void *, void *, void **))dlsym(RTLD_DEFAULT, "MSHookFunction");
         if (fn_MSHook) {
             fn_MSHook((void *)(base + OFF_SERVICE_SEND_SHOOT), (void *)hook_SendShoot, (void **)&orig_SendShoot);
-            fn_MSHook((void *)(base + RVA_NATIVE_SCREEN_SET_RESOLUTION), (void *)my_icall_Screen_SetResolution, (void **)&real_Screen_SetResolution);
-            fn_MSHook((void *)(base + RVA_NATIVE_GL_LOAD_MATRIX), (void *)my_icall_GLLoadPixelMatrixScript, (void **)&real_GLLoadPixelMatrixScript);
-            fn_MSHook((void *)(base + RVA_NATIVE_SCREEN_GET_WIDTH), (void *)my_icall_Screen_get_width, (void **)&real_Screen_get_width_icall);
-            fn_MSHook((void *)(base + RVA_NATIVE_SCREEN_GET_HEIGHT), (void *)my_icall_Screen_get_height, (void **)&real_Screen_get_height_icall);
-            NSLog(@"[MobiArmyMod] MSHookFunction đã cài đặt toàn bộ hooks!");
+            NSLog(@"[MobiArmyMod] MSHookFunction đã cài đặt hook SendShoot!");
         }
 
         g_hooksInstalled = YES;
@@ -978,28 +967,38 @@ static void install_hooks(void) {
     });
 }
 
+static void on_image_loaded(const struct mach_header *mh, intptr_t vmaddr_slide) {
+    Dl_info info;
+    if (dladdr(mh, &info) && info.dli_fname) {
+        if (strstr(info.dli_fname, "UnityFramework")) {
+            NSLog(@"[MobiArmyMod] UnityFramework phát hiện qua dyld tại %p (slide 0x%lx)", mh, vmaddr_slide);
+            unity_base = (uintptr_t)mh;
+            apply_icall_zoom_hooks(unity_base);
+        }
+    }
+}
+
 __attribute__((constructor)) static void MobiArmyModInit(void) {
     NSLog(@"[MobiArmyMod] Dylib khởi chạy trong tiến trình pid: %d", getpid());
 
-    find_unity_base();
+    uintptr_t base = find_unity_base();
+    if (base) {
+        apply_icall_zoom_hooks(base);
+    }
 
-    // Chờ Unity và App khởi động hoàn toàn (1.5s sau active) trên main thread
+    _dyld_register_func_for_add_image(on_image_loaded);
+
+    // Chờ Unity và App khởi động hoàn toàn (2.0s sau active) trên main thread
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(NSNotification * _Nonnull note) {
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 install_hooks();
                 [[MobiHUDManager shared] attachToKeyWindow];
             });
         });
     }];
-
-    // Fallback: Nếu không nhận được notification sau 2.5s thì tự động khởi tạo
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        install_hooks();
-        [[MobiHUDManager shared] attachToKeyWindow];
-    });
 }
