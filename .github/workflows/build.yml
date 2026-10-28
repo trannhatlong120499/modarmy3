@@ -1,0 +1,50 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Theos
+        run: |
+          set -e
+          export THEOS="$HOME/theos"
+          git clone --recursive https://github.com/theos/theos.git "$THEOS"
+          curl -L -o sdks.zip https://github.com/theos/sdks/archive/master.zip
+          unzip -q sdks.zip
+          mkdir -p "$THEOS/sdks"
+          cp -R sdks-master/iPhoneOS*.sdk "$THEOS/sdks/" || true
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+
+      - name: Install ldid
+        run: brew install ldid || true
+
+      - name: Build dylib
+        run: |
+          set -e
+          export PATH="$THEOS/bin:$PATH"
+          make clean || true
+          make FINALPACKAGE=1
+
+      - name: Show output
+        run: |
+          find .theos/obj -name '*.dylib' -print -exec file {} \;
+
+      - name: Prepare Artifacts
+        run: |
+          mkdir -p dist
+          find .theos/obj -name '*.dylib' -exec cp {} dist/ \;
+          cp MobiArmyMod.plist dist/ 2>/dev/null || true
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: MobiArmyMod-Release
+          path: dist/*
+          if-no-files-found: error

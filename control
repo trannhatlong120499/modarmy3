@@ -1,0 +1,9 @@
+Package: com.mobiarmy.mod
+Name: MobiArmy 3 HA Mod (Zoom & Aimbot)
+Depends: mobilesubstrate
+Version: 1.0.1.0.3
+Architecture: iphoneos-arm64
+Description: Mod Zoom map & Aimbot tự động điều chỉnh góc/lực đạn đạo cho MobiArmy 3 HA (Unity IL2CPP)
+Maintainer: Modder
+Author: Modder
+Section: Tweaks
