@@ -22,8 +22,7 @@
 // ==========================================
 // CẤU HÌNH MẶC ĐỊNH
 // ==========================================
-static float g_zoomFactor       = 1.50f;    // Mức zoom mặc định (1.5x)
-static BOOL  g_globalZoom       = NO;       // NO: Chỉ zoom map (mặc định), YES: Zoom toàn bộ
+static float g_zoomFactor       = 3.00f;    // Mức zoom mặc định (3.0x siêu mạnh nhìn toàn bản đồ)
 static BOOL  g_aimbotEnabled    = YES;      // Bật aimbot
 static BOOL  g_highArcMode      = YES;      // YES: Góc cao (High Arc), NO: Góc thấp (Low Arc)
 static float g_gravityFactor    = 1.0f;     // Hệ số trọng lực tinh chỉnh
@@ -33,6 +32,15 @@ static int   g_currentTargetIdx = 0;        // Index mục tiêu hiện tại
 // RVAs trong UnityFramework 1.0.1.0.3
 #define OFF_SERVICE_SEND_SHOOT          0x148704
 #define OFF_BATTLE_MANAGER_CLASS        0x3bb9190
+
+// IL2CPP Runtime APIs (Exported symbols trong UnityFramework)
+#define OFF_DOMAIN_GET                  0x1e67400
+#define OFF_DOMAIN_GET_ASSEMBLIES       0x1e6740c
+#define OFF_ASSEMBLY_GET_IMAGE          0x1e66e80
+#define OFF_IMAGE_GET_NAME              0x1e67c20
+#define OFF_CLASS_FROM_NAME             0x1e66eb8
+#define OFF_CODEGEN_INIT_RUNTIME_META   0x1e69b04
+#define OFF_IL2CPP_RUNTIME_CLASS_INIT   0x1e67930
 
 // Native C++ functions của Unity engine (RVAs tĩnh trong binary)
 #define RVA_NATIVE_SCREEN_GET_WIDTH     0x2b360e4
@@ -54,6 +62,22 @@ static int   g_currentTargetIdx = 0;        // Index mục tiêu hiện tại
 #define OFF_PLAYER_Y            0x27C  // Int32 (4 bytes)
 #define OFF_PLAYER_CUR_X        0x280  // Single (float, 4 bytes)
 #define OFF_PLAYER_CUR_Y        0x284  // Single (float, 4 bytes)
+
+// IL2CPP Opaque Types
+typedef struct Il2CppDomain Il2CppDomain;
+typedef struct Il2CppAssembly Il2CppAssembly;
+typedef struct Il2CppImage Il2CppImage;
+typedef struct Il2CppClass Il2CppClass;
+
+static Il2CppDomain *(*p_domain_get)(void) = NULL;
+static Il2CppAssembly **(*p_domain_get_assemblies)(Il2CppDomain *, size_t *) = NULL;
+static Il2CppImage *(*p_assembly_get_image)(Il2CppAssembly *) = NULL;
+static const char *(*p_image_get_name)(Il2CppImage *) = NULL;
+static Il2CppClass *(*p_class_from_name)(const Il2CppImage *, const char *, const char *) = NULL;
+
+static Il2CppImage *s_gameImage = NULL;
+static Il2CppClass *s_battleClass = NULL;
+static int s_debugScanState = 0;
 
 // Function Pointers & Counters
 static uintptr_t unity_base = 0;
@@ -126,15 +150,8 @@ static uintptr_t find_unity_base(void) {
 }
 
 // ==========================================
-// 1. CƠ CHẾ ZOOM MAP BẤT TỬ (ICALL REPLACEMENT TRONG __DATA)
+// 1. CƠ CHẾ ZOOM MAP TOÀN DIỆN & MẠNH MẼ
 // ==========================================
-static inline bool is_renderer_caller(uintptr_t lr, uintptr_t base) {
-    if (!base) return false;
-    uintptr_t rva = clean_ptr(lr) - clean_ptr(base);
-    return (rva == 0x194188 || rva == 0x194868 || rva == 0x194a98 ||
-            rva == 0x194194 || rva == 0x194874 || rva == 0x194aa4);
-}
-
 static int my_icall_Screen_get_width(void) {
     int w = real_Screen_get_width_icall ? real_Screen_get_width_icall() : 0;
     if (w <= 0) {
@@ -144,14 +161,7 @@ static int my_icall_Screen_get_width(void) {
     }
 
     if (g_zoomFactor > 1.01f) {
-        if (g_globalZoom) {
-            return (int)(w * g_zoomFactor);
-        }
-        uintptr_t lr = (uintptr_t)__builtin_return_address(0);
-        uintptr_t rva = clean_ptr(lr) - clean_ptr(unity_base);
-        if (rva == 0x194188 || rva == 0x194868 || rva == 0x194a98) {
-            return (int)(w * g_zoomFactor);
-        }
+        return (int)(w * g_zoomFactor);
     }
     return w;
 }
@@ -165,25 +175,15 @@ static int my_icall_Screen_get_height(void) {
     }
 
     if (g_zoomFactor > 1.01f) {
-        if (g_globalZoom) {
-            return (int)(h * g_zoomFactor);
-        }
-        uintptr_t lr = (uintptr_t)__builtin_return_address(0);
-        uintptr_t rva = clean_ptr(lr) - clean_ptr(unity_base);
-        if (rva == 0x194194 || rva == 0x194874 || rva == 0x194aa4) {
-            return (int)(h * g_zoomFactor);
-        }
+        return (int)(h * g_zoomFactor);
     }
     return h;
 }
 
 static void my_icall_GLLoadPixelMatrixScript(float left, float right, float bottom, float top) {
     if (g_zoomFactor > 1.01f) {
-        int rw = real_Screen_get_width_icall ? real_Screen_get_width_icall() : 0;
-        if (rw <= 0 || right <= (float)rw * 1.05f) {
-            right *= g_zoomFactor;
-            bottom *= g_zoomFactor;
-        }
+        right *= g_zoomFactor;
+        bottom *= g_zoomFactor;
     }
 
     if (real_GLLoadPixelMatrixScript) {
@@ -289,39 +289,121 @@ static void updateAimSolution(void) {
 }
 
 // ==========================================
-// 3. QUÉT TRẬN ĐẤU AN TOÀN TRỰC TIẾP TỪ BỘ NHỚ (ZERO CRASH)
+// 3. QUÉT TRẬN ĐẤU QUA IL2CPP METADATA AN TOÀN
 // ==========================================
+static void init_il2cpp_api(uintptr_t base) {
+    p_domain_get = (Il2CppDomain *(*)(void))(base + OFF_DOMAIN_GET);
+    p_domain_get_assemblies = (Il2CppAssembly **(*)(Il2CppDomain *, size_t *))(base + OFF_DOMAIN_GET_ASSEMBLIES);
+    p_assembly_get_image = (Il2CppImage *(*)(Il2CppAssembly *))(base + OFF_ASSEMBLY_GET_IMAGE);
+    p_image_get_name = (const char *(*)(Il2CppImage *))(base + OFF_IMAGE_GET_NAME);
+    p_class_from_name = (Il2CppClass *(*)(const Il2CppImage *, const char *, const char *))(base + OFF_CLASS_FROM_NAME);
+}
+
+static uintptr_t resolve_battle_manager_class(uintptr_t base) {
+    if (s_battleClass) return (uintptr_t)s_battleClass;
+
+    // Cách 1: Giải mã Metadata Token tại 0x3bb9190 bằng hàm chính thức của IL2CPP
+    void (*fn_init_meta)(uintptr_t *) = (void (*)(uintptr_t *))(base + OFF_CODEGEN_INIT_RUNTIME_META);
+    if (fn_init_meta) {
+        uintptr_t *pTypeInfo = (uintptr_t *)(base + OFF_BATTLE_MANAGER_CLASS);
+        fn_init_meta(pTypeInfo);
+        if (*pTypeInfo >= 0x100000000ULL && *pTypeInfo < 0x3000000000ULL) {
+            s_battleClass = (Il2CppClass *)*pTypeInfo;
+        }
+    }
+
+    // Cách 2: Tìm qua IL2CPP Domain & Image name
+    if (!s_battleClass) {
+        if (!p_domain_get) {
+            init_il2cpp_api(base);
+        }
+        if (p_domain_get) {
+            Il2CppDomain *domain = p_domain_get();
+            if (domain) {
+                if (!s_gameImage) {
+                    size_t count = 0;
+                    Il2CppAssembly **asms = p_domain_get_assemblies(domain, &count);
+                    if (asms) {
+                        for (size_t i = 0; i < count; i++) {
+                            Il2CppImage *img = p_assembly_get_image(asms[i]);
+                            if (!img) continue;
+                            const char *name = p_image_get_name(img);
+                            if (name && strstr(name, "Assembly-CSharp")) {
+                                s_gameImage = img;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (s_gameImage && p_class_from_name) {
+                    s_battleClass = p_class_from_name(s_gameImage,
+                                                      "lllIIlllllllIlIIIIllIIIIIlllIIIlIlIl",
+                                                      "llIlIlIIlllllllllllIlllIIllIlllIIIlIIIlIIllIllIIIIIIlIlIIIlIlIIlIIlIllIl");
+                }
+            }
+        }
+    }
+
+    // Cách 3: Đọc trực tiếp tokenPtr nếu đã được game khởi tạo trước đó
+    if (!s_battleClass) {
+        uintptr_t tokenPtr = 0;
+        if (safe_read(&tokenPtr, (const void *)(base + OFF_BATTLE_MANAGER_CLASS), sizeof(uintptr_t))) {
+            if (tokenPtr >= 0x100000000ULL && tokenPtr < 0x3000000000ULL) {
+                s_battleClass = (Il2CppClass *)tokenPtr;
+            }
+        }
+    }
+
+    if (!s_battleClass) {
+        s_debugScanState = 3;
+        return 0;
+    }
+
+    // Khởi tạo static_fields nếu chưa chạy .cctor
+    void (*fn_init_class)(Il2CppClass *) = (void (*)(Il2CppClass *))(base + OFF_IL2CPP_RUNTIME_CLASS_INIT);
+    if (fn_init_class) {
+        fn_init_class(s_battleClass);
+    }
+
+    return (uintptr_t)s_battleClass;
+}
+
 static void scanBattleState(void) {
-    if (!unity_base) return;
-
-    // Đọc con trỏ Il2CppClass* của BattleManager (0x3bb9190)
-    uintptr_t classPtr = 0;
-    if (!safe_read(&classPtr, (const void *)(unity_base + OFF_BATTLE_MANAGER_CLASS), sizeof(uintptr_t))) {
+    if (!unity_base) {
+        s_debugScanState = 0;
         g_myPlayer = NULL;
         g_enemyCount = 0;
         return;
     }
 
-    if (classPtr < 0x100000000ULL || classPtr > 0x3000000000ULL) {
+    uintptr_t classPtr = resolve_battle_manager_class(unity_base);
+    if (!classPtr) {
         g_myPlayer = NULL;
         g_enemyCount = 0;
         return;
     }
 
-    // Đọc static_fields (offset 0xA0)
+    // Đọc static_fields (offset 0xA0 của Il2CppClass)
     uintptr_t staticFields = 0;
     if (!safe_read(&staticFields, (const void *)(classPtr + 0xA0), sizeof(uintptr_t)) ||
         staticFields < 0x100000000ULL) {
+        s_debugScanState = 4;
         g_myPlayer = NULL;
         g_enemyCount = 0;
         return;
     }
 
-    // Đọc con trỏ mảng allPlayers (offset 0x8)
+    // Đọc con trỏ mảng allPlayers (thử offset 0x8 trước, rồi 0x10)
     uintptr_t playerArray = 0;
-    if (!safe_read(&playerArray, (const void *)(staticFields + 0x8), sizeof(uintptr_t)) ||
-        playerArray < 0x100000000ULL) {
-        // Chưa vào trận đấu (mảng allPlayers là NULL)
+    safe_read(&playerArray, (const void *)(staticFields + 0x8), sizeof(uintptr_t));
+    if (playerArray < 0x100000000ULL) {
+        safe_read(&playerArray, (const void *)(staticFields + 0x10), sizeof(uintptr_t));
+    }
+
+    if (playerArray < 0x100000000ULL) {
+        // Chưa vào trận (mảng allPlayers là NULL)
+        s_debugScanState = 5;
         g_myPlayer = NULL;
         g_enemyCount = 0;
         return;
@@ -330,45 +412,57 @@ static void scanBattleState(void) {
     int32_t count = 0;
     safe_read(&count, (const void *)(playerArray + 0x18), sizeof(int32_t));
     if (count <= 0 || count > 32) {
+        s_debugScanState = 5;
         g_myPlayer = NULL;
         g_enemyCount = 0;
         return;
     }
 
-    // Đọc index người chơi của mình (offset 0x30, kiểu SByte)
-    int8_t myIdx = -1;
-    safe_read(&myIdx, (const void *)(staticFields + 0x30), sizeof(int8_t));
-
     void *myPlayer = NULL;
-    if (myIdx >= 0 && myIdx < count) {
+
+    // 1. Quét tìm player có flag isMe == 1 (chính xác tuyệt đối)
+    for (int i = 0; i < count; i++) {
         uintptr_t p = 0;
-        safe_read(&p, (const void *)(playerArray + 0x20 + (size_t)myIdx * 8), sizeof(uintptr_t));
+        safe_read(&p, (const void *)(playerArray + 0x20 + (size_t)i * 8), sizeof(uintptr_t));
+        if (!p || p < 0x100000000ULL) continue;
+        uint8_t isMe = 0;
+        safe_read(&isMe, (const void *)(p + OFF_PLAYER_IS_ME), sizeof(uint8_t));
+        if (isMe) {
+            myPlayer = (void *)p;
+            break;
+        }
+    }
+
+    // 2. Nếu flag isMe chưa set, đọc myIdx tại staticFields + 0x30
+    if (!myPlayer) {
+        int8_t myIdx = -1;
+        safe_read(&myIdx, (const void *)(staticFields + 0x30), sizeof(int8_t));
+        if (myIdx >= 0 && myIdx < count) {
+            uintptr_t p = 0;
+            safe_read(&p, (const void *)(playerArray + 0x20 + (size_t)myIdx * 8), sizeof(uintptr_t));
+            if (p >= 0x100000000ULL) {
+                myPlayer = (void *)p;
+            }
+        }
+    }
+
+    // 3. Fallback: Nếu đã có playerArray với count > 0 nhưng chưa rõ ai là mình, lấy tạm player 0
+    if (!myPlayer && count > 0) {
+        uintptr_t p = 0;
+        safe_read(&p, (const void *)(playerArray + 0x20), sizeof(uintptr_t));
         if (p >= 0x100000000ULL) {
             myPlayer = (void *)p;
         }
     }
 
-    // Nếu index chưa cập nhật, quét qua mảng tìm player có isMe == 1
     if (!myPlayer) {
-        for (int i = 0; i < count; i++) {
-            uintptr_t p = 0;
-            safe_read(&p, (const void *)(playerArray + 0x20 + (size_t)i * 8), sizeof(uintptr_t));
-            if (!p || p < 0x100000000ULL) continue;
-            uint8_t isMe = 0;
-            safe_read(&isMe, (const void *)(p + OFF_PLAYER_IS_ME), sizeof(uint8_t));
-            if (isMe) {
-                myPlayer = (void *)p;
-                break;
-            }
-        }
-    }
-
-    if (!myPlayer) {
+        s_debugScanState = 5;
         g_myPlayer = NULL;
         g_enemyCount = 0;
         return;
     }
 
+    s_debugScanState = 6; // ĐÃ VÀO TRẬN ĐẤU THÀNH CÔNG!
     g_myPlayer = myPlayer;
     g_battleUpdateCount++;
 
@@ -472,7 +566,6 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
 @property (nonatomic, strong) UILabel *aimInfoLabel;
 @property (nonatomic, strong) UILabel *targetInfoLabel;
 @property (nonatomic, strong) UISwitch *aimbotSwitch;
-@property (nonatomic, strong) UISwitch *globalZoomSwitch;
 @property (nonatomic, strong) UISegmentedControl *arcSegment;
 @property (nonatomic, strong) UISegmentedControl *zoomSegment;
 @property (nonatomic, strong) UISlider *gravitySlider;
@@ -537,7 +630,7 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
 
 - (void)setupPanelInView:(UIView *)parent {
     CGFloat panelW = 320;
-    CGFloat panelH = 460;
+    CGFloat panelH = 430;
     CGFloat x = (parent.bounds.size.width - panelW) / 2;
     CGFloat y = 30;
 
@@ -567,32 +660,19 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
     CGFloat curY = 42;
 
     // Zoom Factor
-    UILabel *zoomTitle = [[UILabel alloc] initWithFrame:CGRectMake(16, curY, 140, 18)];
-    zoomTitle.text = @"MỨC ZOOM BẢN ĐỒ:";
+    UILabel *zoomTitle = [[UILabel alloc] initWithFrame:CGRectMake(16, curY, 200, 18)];
+    zoomTitle.text = @"MỨC ZOOM BẢN ĐỒ (SIÊU RỘNG):";
     zoomTitle.font = [UIFont boldSystemFontOfSize:11];
     zoomTitle.textColor = [UIColor colorWithWhite:0.75 alpha:1.0];
     [self.panelView addSubview:zoomTitle];
     curY += 20;
 
-    self.zoomSegment = [[UISegmentedControl alloc] initWithItems:@[@"1.0x", @"1.3x", @"1.5x", @"1.8x", @"2.0x"]];
+    self.zoomSegment = [[UISegmentedControl alloc] initWithItems:@[@"1.0x", @"2.0x", @"3.0x", @"4.0x", @"5.0x"]];
     self.zoomSegment.frame = CGRectMake(16, curY, panelW - 32, 26);
-    self.zoomSegment.selectedSegmentIndex = 2; // 1.5x
+    self.zoomSegment.selectedSegmentIndex = 2; // 3.0x mặc định
     [self.zoomSegment addTarget:self action:@selector(onZoomChanged:) forControlEvents:UIControlEventValueChanged];
     [self.panelView addSubview:self.zoomSegment];
-    curY += 32;
-
-    // Zoom Mode Toggle
-    UILabel *globalZoomTitle = [[UILabel alloc] initWithFrame:CGRectMake(16, curY + 2, 200, 24)];
-    globalZoomTitle.text = @"Zoom toàn màn hình (Global)";
-    globalZoomTitle.font = [UIFont systemFontOfSize:11];
-    globalZoomTitle.textColor = [UIColor colorWithWhite:0.75 alpha:1.0];
-    [self.panelView addSubview:globalZoomTitle];
-
-    self.globalZoomSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(panelW - 68, curY, 50, 24)];
-    self.globalZoomSwitch.on = g_globalZoom;
-    [self.globalZoomSwitch addTarget:self action:@selector(onGlobalZoomToggled:) forControlEvents:UIControlEventValueChanged];
-    [self.panelView addSubview:self.globalZoomSwitch];
-    curY += 32;
+    curY += 34;
 
     // Aimbot switch
     UILabel *aimTitle = [[UILabel alloc] initWithFrame:CGRectMake(16, curY + 2, 120, 24)];
@@ -727,14 +807,10 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
 }
 
 - (void)onZoomChanged:(UISegmentedControl *)sender {
-    float values[] = { 1.0f, 1.3f, 1.5f, 1.8f, 2.0f };
+    float values[] = { 1.0f, 2.0f, 3.0f, 4.0f, 5.0f };
     if (sender.selectedSegmentIndex >= 0 && sender.selectedSegmentIndex < 5) {
         g_zoomFactor = values[sender.selectedSegmentIndex];
     }
-}
-
-- (void)onGlobalZoomToggled:(UISwitch *)sender {
-    g_globalZoom = sender.isOn;
 }
 
 - (void)onAimbotToggled:(UISwitch *)sender {
@@ -787,8 +863,15 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
         self.targetInfoLabel.text = @"Chưa vào trận đấu";
         self.targetInfoLabel.textColor = [UIColor yellowColor];
         self.aimInfoLabel.text = @"Góc: --°  |  Lực: --";
-        self.statusLabel.text = [NSString stringWithFormat:@"Zoom: %.1fx (%s) | Chờ trận...",
-                                 g_zoomFactor, g_globalZoom ? "Toàn bộ" : "Bản đồ"];
+
+        const char *stateDesc = "Đang tìm game...";
+        if (s_debugScanState == 1) stateDesc = "Đang kết nối Unity domain...";
+        else if (s_debugScanState == 2) stateDesc = "Đang nạp Assembly-CSharp...";
+        else if (s_debugScanState == 3) stateDesc = "Đang tìm BattleManager...";
+        else if (s_debugScanState == 4) stateDesc = "BattleManager OK (Chờ tạo phòng)...";
+        else if (s_debugScanState == 5) stateDesc = "Sẵn sàng (Vào trận để quét)...";
+
+        self.statusLabel.text = [NSString stringWithFormat:@"Zoom: %.1fx | %s", g_zoomFactor, stateDesc];
         return;
     }
 
@@ -833,10 +916,13 @@ static void install_hooks(void) {
 
         NSLog(@"[MobiArmyMod] Bắt đầu cài đặt Hooks vào UnityFramework (0x%lx)...", base);
 
-        // 1. Áp dụng ngay Icall Pointer Zoom trong __DATA.__bss
+        // 1. Áp dụng ngay Icall Pointer Zoom trong __DATA.__bss (Bất tử trên mọi thiết bị, không cần Substrate)
         apply_icall_zoom_hooks(base);
 
-        // 2. Hook qua MSHookFunction nếu có Substrate/Ellekit (Dopamine / Sileo)
+        // 2. Khởi tạo IL2CPP metadata APIs
+        init_il2cpp_api(base);
+
+        // 3. Hook qua MSHookFunction nếu có Substrate/Ellekit (Dopamine / Sileo)
         void (*fn_MSHook)(void *, void *, void **) = (void (*)(void *, void *, void **))dlsym(RTLD_DEFAULT, "MSHookFunction");
         if (fn_MSHook) {
             fn_MSHook((void *)(base + OFF_SERVICE_SEND_SHOOT), (void *)hook_SendShoot, (void **)&orig_SendShoot);
@@ -853,14 +939,14 @@ __attribute__((constructor)) static void MobiArmyModInit(void) {
 
     find_unity_base();
 
-    // Chờ Unity và App khởi động hoàn toàn (2.0s sau active) trên main thread
+    // Chờ Unity và App khởi động hoàn toàn (1.5s sau active) trên main thread
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(NSNotification * _Nonnull note) {
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 install_hooks();
                 [[MobiHUDManager shared] attachToKeyWindow];
             });
