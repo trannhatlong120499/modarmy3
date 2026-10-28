@@ -31,11 +31,13 @@ static float g_forceScale       = 1.0f;     // Hệ số lực bắn tinh chỉn
 static int   g_currentTargetIdx = 0;        // Index mục tiêu hiện tại
 
 // RVAs trong UnityFramework 1.0.1.0.3
-#define OFF_SCREEN_GET_WIDTH            0x1a81aa0
-#define OFF_SCREEN_GET_HEIGHT           0x1a81ae0
-#define OFF_GL_LOAD_PIXEL_MATRIX        0x1a830e4
 #define OFF_SERVICE_SEND_SHOOT          0x148704
 #define OFF_BATTLE_MANAGER_CLASS        0x3bb9190
+
+// Native C++ functions của Unity engine (RVAs tĩnh trong binary)
+#define RVA_NATIVE_SCREEN_GET_WIDTH     0x2b360e4
+#define RVA_NATIVE_SCREEN_GET_HEIGHT    0x2b360f8
+#define RVA_NATIVE_GL_LOAD_MATRIX       0x2b364f0
 
 // Slots con trỏ icall trong phân vùng __DATA.__bss (Ghi đè trực tiếp an toàn tuyệt đối)
 #define OFF_ICALL_SCREEN_GET_WIDTH      0x4084f08
@@ -60,7 +62,7 @@ static uint64_t g_battleUpdateCount = 0;
 
 static void (*orig_SendShoot)(void *self, int8_t shootType, int16_t angle, int16_t x, int16_t y, int8_t force, int8_t force2, int8_t unk, void *method) = NULL;
 
-// Native icalls đã resolve
+// Native icalls
 static int (*real_Screen_get_width_icall)(void) = NULL;
 static int (*real_Screen_get_height_icall)(void) = NULL;
 static void (*real_GLLoadPixelMatrixScript)(float left, float right, float bottom, float top) = NULL;
@@ -134,12 +136,6 @@ static inline bool is_renderer_caller(uintptr_t lr, uintptr_t base) {
 }
 
 static int my_icall_Screen_get_width(void) {
-    if (!real_Screen_get_width_icall && unity_base) {
-        void *(*resolve_icall)(const char *) = (void *(*)(const char *))(unity_base + 0x1e69ac0);
-        if (resolve_icall) {
-            real_Screen_get_width_icall = (int (*)(void))resolve_icall((const char *)(unity_base + 0x37311a6));
-        }
-    }
     int w = real_Screen_get_width_icall ? real_Screen_get_width_icall() : 0;
     if (w <= 0) {
         CGSize sz = [UIScreen mainScreen].bounds.size;
@@ -161,12 +157,6 @@ static int my_icall_Screen_get_width(void) {
 }
 
 static int my_icall_Screen_get_height(void) {
-    if (!real_Screen_get_height_icall && unity_base) {
-        void *(*resolve_icall)(const char *) = (void *(*)(const char *))(unity_base + 0x1e69ac0);
-        if (resolve_icall) {
-            real_Screen_get_height_icall = (int (*)(void))resolve_icall((const char *)(unity_base + 0x37311c6));
-        }
-    }
     int h = real_Screen_get_height_icall ? real_Screen_get_height_icall() : 0;
     if (h <= 0) {
         CGSize sz = [UIScreen mainScreen].bounds.size;
@@ -188,13 +178,6 @@ static int my_icall_Screen_get_height(void) {
 }
 
 static void my_icall_GLLoadPixelMatrixScript(float left, float right, float bottom, float top) {
-    if (!real_GLLoadPixelMatrixScript && unity_base) {
-        void *(*resolve_icall)(const char *) = (void *(*)(const char *))(unity_base + 0x1e69ac0);
-        if (resolve_icall) {
-            real_GLLoadPixelMatrixScript = (void (*)(float, float, float, float))resolve_icall((const char *)(unity_base + 0x373172a));
-        }
-    }
-
     if (g_zoomFactor > 1.01f) {
         int rw = real_Screen_get_width_icall ? real_Screen_get_width_icall() : 0;
         if (rw <= 0 || right <= (float)rw * 1.05f) {
@@ -212,17 +195,9 @@ static void apply_icall_zoom_hooks(uintptr_t base) {
     if (!base) return;
 
     @try {
-        void *(*resolve_icall)(const char *) = (void *(*)(const char *))(base + 0x1e69ac0);
-
-        if (!real_Screen_get_width_icall && resolve_icall) {
-            real_Screen_get_width_icall = (int (*)(void))resolve_icall((const char *)(base + 0x37311a6));
-        }
-        if (!real_Screen_get_height_icall && resolve_icall) {
-            real_Screen_get_height_icall = (int (*)(void))resolve_icall((const char *)(base + 0x37311c6));
-        }
-        if (!real_GLLoadPixelMatrixScript && resolve_icall) {
-            real_GLLoadPixelMatrixScript = (void (*)(float, float, float, float))resolve_icall((const char *)(base + 0x373172a));
-        }
+        real_Screen_get_width_icall = (int (*)(void))(base + RVA_NATIVE_SCREEN_GET_WIDTH);
+        real_Screen_get_height_icall = (int (*)(void))(base + RVA_NATIVE_SCREEN_GET_HEIGHT);
+        real_GLLoadPixelMatrixScript = (void (*)(float, float, float, float))(base + RVA_NATIVE_GL_LOAD_MATRIX);
 
         // Ghi đè con trỏ trong phân vùng __DATA.__bss sang hàm zoom của chúng ta
         *(uintptr_t *)(base + OFF_ICALL_SCREEN_GET_WIDTH)  = (uintptr_t)my_icall_Screen_get_width;
@@ -316,41 +291,24 @@ static void updateAimSolution(void) {
 // ==========================================
 // 3. QUÉT TRẬN ĐẤU AN TOÀN TRỰC TIẾP TỪ BỘ NHỚ (ZERO CRASH)
 // ==========================================
-static uintptr_t get_battle_manager_class(void) {
-    if (!unity_base) return 0;
-    uintptr_t classPtr = 0;
-    safe_read(&classPtr, (const void *)(unity_base + OFF_BATTLE_MANAGER_CLASS), sizeof(uintptr_t));
-    if (classPtr < 0x100000000ULL) {
-        void (*init_meta)(uintptr_t *) = (void (*)(uintptr_t *))(unity_base + 0x1e69b04);
-        if (init_meta) {
-            init_meta((uintptr_t *)(unity_base + OFF_BATTLE_MANAGER_CLASS));
-            safe_read(&classPtr, (const void *)(unity_base + OFF_BATTLE_MANAGER_CLASS), sizeof(uintptr_t));
-        }
-    }
-    if (classPtr >= 0x100000000ULL && classPtr < 0x3000000000ULL) {
-        int initState = 0;
-        safe_read(&initState, (const void *)(classPtr + 0xe4), sizeof(int));
-        if (initState == 0) {
-            void (*runtime_class_init)(uintptr_t) = (void (*)(uintptr_t))(unity_base + 0x1e69c58);
-            if (runtime_class_init) {
-                runtime_class_init(classPtr);
-            }
-        }
-        return classPtr;
-    }
-    return 0;
-}
-
 static void scanBattleState(void) {
     if (!unity_base) return;
 
-    uintptr_t classPtr = get_battle_manager_class();
-    if (!classPtr) {
+    // Đọc con trỏ Il2CppClass* của BattleManager (0x3bb9190)
+    uintptr_t classPtr = 0;
+    if (!safe_read(&classPtr, (const void *)(unity_base + OFF_BATTLE_MANAGER_CLASS), sizeof(uintptr_t))) {
         g_myPlayer = NULL;
         g_enemyCount = 0;
         return;
     }
 
+    if (classPtr < 0x100000000ULL || classPtr > 0x3000000000ULL) {
+        g_myPlayer = NULL;
+        g_enemyCount = 0;
+        return;
+    }
+
+    // Đọc static_fields (offset 0xA0)
     uintptr_t staticFields = 0;
     if (!safe_read(&staticFields, (const void *)(classPtr + 0xA0), sizeof(uintptr_t)) ||
         staticFields < 0x100000000ULL) {
@@ -677,8 +635,8 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
 
     UIButton *nextTargetBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     nextTargetBtn.frame = CGRectMake(panelW - 76, curY, 60, 28);
-    [nextTargetBtn setTitle:@"Tiếp ▶" forState:UIControlStateNormal];
-    [nextTargetBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    nextTargetBtn.setTitle:@"Tiếp ▶" forState:UIControlStateNormal];
+    nextTargetBtn.setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     nextTargetBtn.titleLabel.font = [UIFont systemFontOfSize:12];
     nextTargetBtn.backgroundColor = [UIColor colorWithWhite:0.25 alpha:0.8];
     nextTargetBtn.layer.cornerRadius = 6;
@@ -772,9 +730,6 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
     float values[] = { 1.0f, 1.3f, 1.5f, 1.8f, 2.0f };
     if (sender.selectedSegmentIndex >= 0 && sender.selectedSegmentIndex < 5) {
         g_zoomFactor = values[sender.selectedSegmentIndex];
-        if (unity_base) {
-            apply_icall_zoom_hooks(unity_base);
-        }
     }
 }
 
@@ -878,13 +833,10 @@ static void install_hooks(void) {
 
         NSLog(@"[MobiArmyMod] Bắt đầu cài đặt Hooks vào UnityFramework (0x%lx)...", base);
 
-        // 1. Áp dụng ngay Icall Pointer Zoom trong __DATA.__bss (Bất tử trên mọi thiết bị, không cần Substrate)
+        // 1. Áp dụng ngay Icall Pointer Zoom trong __DATA.__bss
         apply_icall_zoom_hooks(base);
 
-        // 2. Khởi tạo metadata BattleManager
-        get_battle_manager_class();
-
-        // 3. Hook qua MSHookFunction nếu có Substrate/Ellekit (Dopamine / Sileo)
+        // 2. Hook qua MSHookFunction nếu có Substrate/Ellekit (Dopamine / Sileo)
         void (*fn_MSHook)(void *, void *, void **) = (void (*)(void *, void *, void **))dlsym(RTLD_DEFAULT, "MSHookFunction");
         if (fn_MSHook) {
             fn_MSHook((void *)(base + OFF_SERVICE_SEND_SHOOT), (void *)hook_SendShoot, (void **)&orig_SendShoot);
@@ -899,26 +851,19 @@ static void install_hooks(void) {
 __attribute__((constructor)) static void MobiArmyModInit(void) {
     NSLog(@"[MobiArmyMod] Dylib khởi chạy trong tiến trình pid: %d", getpid());
 
-    // Chỉ tìm base, KHÔNG gọi hàm game trong constructor
     find_unity_base();
 
-    // Chờ Unity và App khởi động hoàn toàn (1.5s sau active) trên main thread
+    // Chờ Unity và App khởi động hoàn toàn (2.0s sau active) trên main thread
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(NSNotification * _Nonnull note) {
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 install_hooks();
                 [[MobiHUDManager shared] attachToKeyWindow];
             });
         });
     }];
-
-    // Dự phòng nếu app đã active từ trước khi dylib được nạp
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        install_hooks();
-        [[MobiHUDManager shared] attachToKeyWindow];
-    });
 }
