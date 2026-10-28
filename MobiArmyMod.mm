@@ -9,6 +9,7 @@
 #import <dispatch/dispatch.h>
 #import <mach/mach.h>
 #import <mach/vm_map.h>
+#import <mach/mach_time.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <substrate.h>
@@ -23,7 +24,7 @@
 // CẤU HÌNH MẶC ĐỊNH
 // ==========================================
 static float g_zoomFactor       = 1.5f;     // Mức zoom mặc định (1.2x - 2.0x)
-static BOOL  g_globalZoom       = YES;      // YES: Zoom toàn cảnh đảm bảo ăn 100% trên màn hình lớn
+static BOOL  g_globalZoom       = YES;      // Zoom toàn cảnh
 static BOOL  g_aimbotEnabled    = YES;      // Bật aimbot
 static BOOL  g_highArcMode      = YES;      // YES: Góc cao (High Arc), NO: Góc thấp (Low Arc)
 static float g_gravityFactor    = 1.0f;     // Hệ số trọng lực tinh chỉnh
@@ -35,9 +36,10 @@ static int   g_currentTargetIdx = 0;        // Index mục tiêu hiện tại
 #define OFF_SCREEN_GET_HEIGHT           0x1a81ae0
 #define OFF_GL_LOAD_PIXEL_MATRIX        0x1a830e4
 #define OFF_SERVICE_SEND_SHOOT          0x148704
-#define OFF_BATTLE_MANAGER_CLASS_PTR    0x3bb9190
+#define OFF_PLAYER_UPDATE               0x9f244
+#define OFF_BATTLE_UPDATE               0x297090
 
-// Offsets của thực thể Player (Đã kiểm tra khớp chính xác với dump.cs 1.0.1.0.3)
+// Offsets của thực thể Player (Khớp chính xác 100% với metadata dump.cs 1.0.1.0.3)
 #define OFF_PLAYER_IS_ME        0x10   // Boolean (1 byte)
 #define OFF_PLAYER_TEAM         0x13   // SByte (1 byte)
 #define OFF_PLAYER_ID           0x18   // Int32 (4 bytes)
@@ -54,6 +56,8 @@ static int (*orig_get_width)(void) = NULL;
 static int (*orig_get_height)(void) = NULL;
 static void (*orig_LoadPixelMatrix)(float left, float right, float bottom, float top, void *method) = NULL;
 static void (*orig_SendShoot)(void *self, int8_t shootType, int16_t angle, int16_t x, int16_t y, int8_t force, int8_t force2, int8_t unk, void *method) = NULL;
+static void (*orig_PlayerUpdate)(void *self, void *method) = NULL;
+static void (*orig_BattleUpdate)(void *self, void *method) = NULL;
 
 // ==========================================
 // CẤU TRÚC DỮ LIỆU ĐỊCH & QUỸ ĐẠO BẮN
@@ -81,6 +85,9 @@ static EnemyTarget g_enemyList[MAX_TARGETS];
 static int g_enemyCount = 0;
 static AimSolution g_lastSolution = { 45, 20, 0, 0.0f, false };
 static int32_t g_lastMyX = 0, g_lastMyY = 0;
+static void *g_myPlayer = NULL;
+static int8_t g_myTeam = 0;
+static uint64_t g_lastPlayerUpdateTime = 0;
 
 // ---------- Helper đọc bộ nhớ an toàn (Chống Crash EXC_BAD_ACCESS 100%) ----------
 static inline bool safe_read(void *dst, const void *src, size_t size) {
@@ -104,16 +111,12 @@ static uintptr_t find_unity_base(void) {
 
 // Strip PAC trên ARM64E (A16 Bionic / iPhone 14 Pro Max)
 static inline uintptr_t clean_ptr(uintptr_t ptr) {
-    // Trên iOS 64-bit, không gian địa chỉ ứng dụng luôn nằm ở < 0x8000000000
-    // Các bit PAC (Pointer Authentication) và tag nằm ở các bit cao 40..63
-    // Mặt nạ bit loại bỏ hoàn toàn PAC mà không cần lệnh inline asm xpaci (tương thích mọi compiler)
     return ptr & 0x0000007FFFFFFFFFULL;
 }
 
 static inline bool is_map_renderer_call(uintptr_t ra) {
     if (g_globalZoom) return true;
     uintptr_t clean_ra = clean_ptr(ra);
-    // Dải địa chỉ class Renderer map lIIlIIIIllIlllllllllIlIIIIlIllIIIlII (0x192000 - 0x196000)
     if (clean_ra >= unity_base + 0x177000 && clean_ra <= unity_base + 0x196000) {
         return true;
     }
@@ -218,103 +221,118 @@ static AimSolution calculateAim(int32_t x0, int32_t y0, int32_t x1, int32_t y1, 
     return sol;
 }
 
+// Cập nhật tính toán đường ngắm
+static void updateAimSolution(void) {
+    if (g_enemyCount > 0) {
+        if (g_currentTargetIdx >= g_enemyCount) g_currentTargetIdx = 0;
+        EnemyTarget *target = &g_enemyList[g_currentTargetIdx];
+        float dx = (float)(target->x - g_lastMyX);
+        float dy = (float)(target->y - g_lastMyY);
+        target->distance = sqrtf(dx * dx + dy * dy);
+        g_lastSolution = calculateAim(g_lastMyX, g_lastMyY, target->x, target->y, g_gravityFactor, g_forceScale, g_highArcMode);
+    } else {
+        g_lastSolution.found = false;
+    }
+}
+
 // ==========================================
-// 3. QUÉT BỘ NHỚ VỊ TRÍ ĐỊCH (AN TOÀN TUYỆT ĐỐI)
+// 3. HOOK REAL-TIME PLAYER UPDATE (TỰ ĐỘNG BẮT TOẠ ĐỘ)
 // ==========================================
-static void updateTargetsFromMemory(void) {
-    g_enemyCount = 0;
-    if (!unity_base) return;
-
-    // 1. Kiểm tra xem BattleManager class pointer đã được init chưa
-    uintptr_t rawClass = 0;
-    if (!safe_read(&rawClass, (const void *)(unity_base + OFF_BATTLE_MANAGER_CLASS_PTR), sizeof(uintptr_t))) return;
-    if (rawClass < 0x100000000ULL) return;
-
-    // 2. Kiểm tra cctor_finished: [bmClass + 0xe4] != 0
-    uint32_t cctorFinished = 0;
-    if (!safe_read(&cctorFinished, (const void *)(rawClass + 0xe4), sizeof(uint32_t))) return;
-    if (!cctorFinished) return;
-
-    // 3. static_fields: [bmClass + 0xa0]
-    uintptr_t staticFields = 0;
-    if (!safe_read(&staticFields, (const void *)(rawClass + 0xa0), sizeof(uintptr_t))) return;
-    if (staticFields < 0x100000000ULL) return;
-
-    // 4. Player[] array: [staticFields + 0x8]
-    uintptr_t playersArr = 0;
-    if (!safe_read(&playersArr, (const void *)(staticFields + 0x8), sizeof(uintptr_t))) return;
-    if (playersArr < 0x100000000ULL) return;
-
-    uint32_t count = 0;
-    if (!safe_read(&count, (const void *)(playersArr + 0x18), sizeof(uint32_t))) return;
-    if (count == 0 || count > 32) return;
-
-    // 5. Quét mảng tìm MyPlayer và danh sách địch trực tiếp từ RAM (Không gọi IL2CPP -> Không bao giờ crash!)
-    uintptr_t myPlayerPtr = 0;
-    int8_t myTeam = 0;
-
-    for (uint32_t i = 0; i < count; i++) {
-        uintptr_t p = 0;
-        if (!safe_read(&p, (const void *)(playersArr + 0x20 + i * sizeof(void *)), sizeof(uintptr_t))) continue;
-        if (p < 0x100000000ULL) continue;
+static void hook_PlayerUpdate(void *self, void *method) {
+    if (self && (uintptr_t)self >= 0x100000000ULL) {
+        g_lastPlayerUpdateTime = mach_absolute_time();
 
         uint8_t isMe = 0;
-        if (!safe_read(&isMe, (const void *)(p + OFF_PLAYER_IS_ME), sizeof(uint8_t))) continue;
-
-        if (isMe != 0) {
-            myPlayerPtr = p;
-            safe_read(&g_lastMyX, (const void *)(p + OFF_PLAYER_X), sizeof(int32_t));
-            safe_read(&g_lastMyY, (const void *)(p + OFF_PLAYER_Y), sizeof(int32_t));
-            safe_read(&myTeam, (const void *)(p + OFF_PLAYER_TEAM), sizeof(int8_t));
-            break;
-        }
-    }
-
-    if (!myPlayerPtr) {
-        // Chưa vào trận hoặc chưa spawn nhân vật
-        return;
-    }
-
-    // 6. Lấy danh sách đối thủ
-    for (uint32_t i = 0; i < count; i++) {
-        uintptr_t p = 0;
-        if (!safe_read(&p, (const void *)(playersArr + 0x20 + i * sizeof(void *)), sizeof(uintptr_t))) continue;
-        if (p < 0x100000000ULL || p == myPlayerPtr) continue;
+        safe_read(&isMe, (const void *)((uintptr_t)self + OFF_PLAYER_IS_ME), sizeof(uint8_t));
 
         int8_t team = 0;
         int32_t hp = 0, px = 0, py = 0, pid = 0;
-        if (!safe_read(&team, (const void *)(p + OFF_PLAYER_TEAM), sizeof(int8_t))) continue;
-        if (!safe_read(&hp, (const void *)(p + OFF_PLAYER_HP), sizeof(int32_t))) continue;
-        if (!safe_read(&px, (const void *)(p + OFF_PLAYER_X), sizeof(int32_t))) continue;
-        if (!safe_read(&py, (const void *)(p + OFF_PLAYER_Y), sizeof(int32_t))) continue;
-        safe_read(&pid, (const void *)(p + OFF_PLAYER_ID), sizeof(int32_t));
+        safe_read(&team, (const void *)((uintptr_t)self + OFF_PLAYER_TEAM), sizeof(int8_t));
+        safe_read(&hp, (const void *)((uintptr_t)self + OFF_PLAYER_HP), sizeof(int32_t));
+        safe_read(&px, (const void *)((uintptr_t)self + OFF_PLAYER_X), sizeof(int32_t));
+        safe_read(&py, (const void *)((uintptr_t)self + OFF_PLAYER_Y), sizeof(int32_t));
+        safe_read(&pid, (const void *)((uintptr_t)self + OFF_PLAYER_ID), sizeof(int32_t));
 
-        if (team != myTeam && hp > 0 && g_enemyCount < MAX_TARGETS) {
-            EnemyTarget enemy;
-            enemy.id = pid;
-            enemy.x = px;
-            enemy.y = py;
-            enemy.hp = hp;
-            enemy.team = team;
-            float dx = (float)(px - g_lastMyX);
-            float dy = (float)(py - g_lastMyY);
-            enemy.distance = sqrtf(dx * dx + dy * dy);
-            snprintf(enemy.name, sizeof(enemy.name), "Địch #%d (HP:%d)", pid, hp);
-            g_enemyList[g_enemyCount++] = enemy;
+        // Fallback đọc toạ độ float nếu int = 0
+        if (px == 0 && py == 0) {
+            float fx = 0, fy = 0;
+            safe_read(&fx, (const void *)((uintptr_t)self + OFF_PLAYER_CUR_X), sizeof(float));
+            safe_read(&fy, (const void *)((uintptr_t)self + OFF_PLAYER_CUR_Y), sizeof(float));
+            if (fx != 0 || fy != 0) {
+                px = (int32_t)fx;
+                py = (int32_t)fy;
+            }
+        }
+
+        if (isMe != 0) {
+            g_myPlayer = self;
+            g_lastMyX = px;
+            g_lastMyY = py;
+            g_myTeam = team;
+        } else if (hp > 0 || pid != 0) {
+            // Không tính đồng đội nếu ở trận đấu đội
+            BOOL isTeammate = (g_myTeam != 0 && team == g_myTeam);
+            if (!isTeammate) {
+                int32_t targetId = pid != 0 ? pid : (int32_t)((uintptr_t)self & 0xFFFF);
+                if (hp > 0) {
+                    bool found = false;
+                    for (int i = 0; i < g_enemyCount; i++) {
+                        if (g_enemyList[i].id == targetId) {
+                            g_enemyList[i].x = px;
+                            g_enemyList[i].y = py;
+                            g_enemyList[i].hp = hp;
+                            g_enemyList[i].team = team;
+                            float dx = (float)(px - g_lastMyX);
+                            float dy = (float)(py - g_lastMyY);
+                            g_enemyList[i].distance = sqrtf(dx * dx + dy * dy);
+                            snprintf(g_enemyList[i].name, sizeof(g_enemyList[i].name), "Địch #%d (HP:%d)", targetId, hp);
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found && g_enemyCount < MAX_TARGETS) {
+                        EnemyTarget enemy;
+                        enemy.id = targetId;
+                        enemy.x = px;
+                        enemy.y = py;
+                        enemy.hp = hp;
+                        enemy.team = team;
+                        float dx = (float)(px - g_lastMyX);
+                        float dy = (float)(py - g_lastMyY);
+                        enemy.distance = sqrtf(dx * dx + dy * dy);
+                        snprintf(enemy.name, sizeof(enemy.name), "Địch #%d (HP:%d)", targetId, hp);
+                        g_enemyList[g_enemyCount++] = enemy;
+                    }
+                } else {
+                    // Địch đã chết -> xoá khỏi danh sách mục tiêu
+                    for (int i = 0; i < g_enemyCount; i++) {
+                        if (g_enemyList[i].id == targetId) {
+                            for (int j = i; j < g_enemyCount - 1; j++) {
+                                g_enemyList[j] = g_enemyList[j + 1];
+                            }
+                            g_enemyCount--;
+                            if (g_currentTargetIdx >= g_enemyCount) g_currentTargetIdx = 0;
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
 
-    if (g_enemyCount == 0) {
-        g_lastSolution.found = false;
-        return;
+    if (orig_PlayerUpdate) {
+        orig_PlayerUpdate(self, method);
     }
+}
 
-    if (g_currentTargetIdx >= g_enemyCount) {
-        g_currentTargetIdx = 0;
+// Hook vòng lặp cập nhật trận đấu
+static void hook_BattleUpdate(void *self, void *method) {
+    if (self) {
+        g_lastPlayerUpdateTime = mach_absolute_time();
     }
-
-    EnemyTarget *target = &g_enemyList[g_currentTargetIdx];
-    g_lastSolution = calculateAim(g_lastMyX, g_lastMyY, target->x, target->y, g_gravityFactor, g_forceScale, g_highArcMode);
+    if (orig_BattleUpdate) {
+        orig_BattleUpdate(self, method);
+    }
 }
 
 // ==========================================
@@ -322,7 +340,7 @@ static void updateTargetsFromMemory(void) {
 // ==========================================
 static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t x, int16_t y, int8_t force, int8_t force2, int8_t unk, void *method) {
     @try {
-        updateTargetsFromMemory();
+        updateAimSolution();
         if (g_aimbotEnabled && g_lastSolution.found) {
             angle = g_lastSolution.angle;
             force = g_lastSolution.force;
@@ -584,7 +602,7 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
         [self.panelView.superview bringSubviewToFront:self.panelView];
         [self refreshUI];
         if (!self.updateTimer) {
-            self.updateTimer = [NSTimer scheduledTimerWithTimeInterval:0.8
+            self.updateTimer = [NSTimer scheduledTimerWithTimeInterval:0.5
                                                                 target:self
                                                               selector:@selector(refreshUI)
                                                               userInfo:nil
@@ -641,35 +659,31 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
 }
 
 - (void)refreshUI {
-    if (!unity_base) {
-        self.targetInfoLabel.text = @"Đang khởi tạo...";
-        self.aimInfoLabel.text = @"Góc: --°  |  Lực: --";
-        self.statusLabel.text = @"Vui lòng chờ Unity...";
-        return;
-    }
+    static mach_timebase_info_data_t s_timebase;
+    if (s_timebase.denom == 0) mach_timebase_info(&s_timebase);
 
-    uintptr_t rawClass = 0;
-    if (!safe_read(&rawClass, (const void *)(unity_base + OFF_BATTLE_MANAGER_CLASS_PTR), sizeof(uintptr_t)) || rawClass < 0x100000000ULL) {
+    uint64_t elapsedNs = (g_lastPlayerUpdateTime > 0) ? (mach_absolute_time() - g_lastPlayerUpdateTime) * s_timebase.numer / s_timebase.denom : 99999999999ULL;
+    BOOL inBattle = (g_lastPlayerUpdateTime > 0 && elapsedNs < 5000000000ULL); // Cập nhật trong vòng 5.0 giây
+
+    if (!inBattle) {
+        g_enemyCount = 0;
+        g_myPlayer = NULL;
         self.targetInfoLabel.text = @"Chưa vào trận đấu";
         self.aimInfoLabel.text = @"Góc: --°  |  Lực: --";
         self.statusLabel.text = @"Vào trận để tự động quét địch";
         return;
     }
 
-    uint32_t cctorFinished = 0;
-    if (!safe_read(&cctorFinished, (const void *)(rawClass + 0xe4), sizeof(uint32_t)) || !cctorFinished) {
-        self.targetInfoLabel.text = @"Chưa vào trận đấu";
-        self.aimInfoLabel.text = @"Góc: --°  |  Lực: --";
-        self.statusLabel.text = @"Vào trận để tự động quét địch";
-        return;
-    }
-
-    updateTargetsFromMemory();
+    updateAimSolution();
 
     if (g_enemyCount == 0) {
-        self.targetInfoLabel.text = @"Không có mục tiêu địch";
+        if (g_myPlayer != NULL) {
+            self.targetInfoLabel.text = [NSString stringWithFormat:@"Đã vào trận (Toạ độ: %d, %d)", g_lastMyX, g_lastMyY];
+        } else {
+            self.targetInfoLabel.text = @"Đã vào trận (Chờ quét địch)";
+        }
         self.aimInfoLabel.text = @"Góc: --°  |  Lực: --";
-        self.statusLabel.text = @"Đang chờ lượt hoặc chưa có địch";
+        self.statusLabel.text = @"Đang quét vị trí đối thủ...";
         return;
     }
 
@@ -703,13 +717,19 @@ static void install_hooks(void) {
     MSHookFunction((void *)(base + OFF_SCREEN_GET_WIDTH), (void *)hook_get_width, (void **)&orig_get_width);
     MSHookFunction((void *)(base + OFF_SCREEN_GET_HEIGHT), (void *)hook_get_height, (void **)&orig_get_height);
 
-    // 2. Hook GL.LoadPixelMatrix (0x1a830e4) để ép ma trận render mở rộng tầm nhìn 100%
+    // 2. Hook GL.LoadPixelMatrix (0x1a830e4)
     MSHookFunction((void *)(base + OFF_GL_LOAD_PIXEL_MATRIX), (void *)hook_LoadPixelMatrix, (void **)&orig_LoadPixelMatrix);
 
     // 3. Hook SendShoot để auto-aim
     MSHookFunction((void *)(base + OFF_SERVICE_SEND_SHOOT), (void *)hook_SendShoot, (void **)&orig_SendShoot);
 
-    NSLog(@"[MobiArmyMod] MSHookFunction installed successfully on Screen, GL.LoadPixelMatrix & SendShoot!");
+    // 4. Hook Player.Update (0x9f244) để tự động bắt toạ độ Player & Địch realtime 100%
+    MSHookFunction((void *)(base + OFF_PLAYER_UPDATE), (void *)hook_PlayerUpdate, (void **)&orig_PlayerUpdate);
+
+    // 5. Hook BattleManager.Update (0x297090) để nhận biết trận đấu bắt đầu
+    MSHookFunction((void *)(base + OFF_BATTLE_UPDATE), (void *)hook_BattleUpdate, (void **)&orig_BattleUpdate);
+
+    NSLog(@"[MobiArmyMod] MSHookFunction installed successfully on Player.Update, Battle.Update, Screen & SendShoot!");
 }
 
 __attribute__((constructor)) static void MobiArmyModInit(void) {
