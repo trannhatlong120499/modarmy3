@@ -120,19 +120,6 @@ static uintptr_t find_unity_base(void) {
     return 0;
 }
 
-// Strip PAC trên ARM64E (A16 Bionic / iPhone 14 Pro Max)
-static inline uintptr_t clean_ptr(uintptr_t ptr) {
-    return ptr & 0x0000007FFFFFFFFFULL;
-}
-
-static inline bool is_map_renderer_call(uintptr_t ra) {
-    if (g_globalZoom) return true;
-    uintptr_t clean_ra = clean_ptr(ra);
-    if (clean_ra >= unity_base + 0x177000 && clean_ra <= unity_base + 0x196000) {
-        return true;
-    }
-    return false;
-}
 
 // ==========================================
 // 1. ZOOM HOOK (Screen & GL.LoadPixelMatrix)
