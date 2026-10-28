@@ -1,6 +1,6 @@
 //
 //  MobiArmyMod.mm
-//  MobiArmy 3 HA Mod Dylib - Siêu Thu Nhỏ Map (Hard Zoom 1.0x-5.0x) & Auto-Aim Bất Tử Zero Crash
+//  MobiArmy 3 HA Mod Dylib - Siêu Thu Nhỏ Map (Hard Patch Zoom 1.0x-5.0x) & Auto-Aim Bất Tử Zero Crash
 //
 //  Tương thích 100%: TrollStore / TrollFools / Dopamine / Sileo / Rootless / Rootful
 //  Kiến trúc: ARM64 + ARM64E (Hỗ trợ từ iPhone X tới iPhone 16 Pro Max, iOS 14.0 - 18.x)
@@ -32,12 +32,24 @@ static int   g_currentTargetIdx = 0;        // Index mục tiêu hiện tại
 #define OFF_SCREEN_GET_WIDTH            0xF3A2C
 #define OFF_SCREEN_GET_HEIGHT           0xF3B24
 
+// Hard-patch targets trong code segment (__TEXT)
+#define RVA_MGRAPHICS_CCTOR_SCALE       0x194DEC  // mov w9, #2 -> 0x52800049
+#define RVA_MGRAPHICS_DRAWREGION_SCALE  0x18F15C  // ldr w8, [x8, #0x18] -> 0xb9401908
+#define RVA_GETWIDTH_SCALE              0xF3A8C   // ldr w9, [x9, #0x18] -> 0xb9401929
+#define RVA_GETHEIGHT_SCALE             0xF3B84   // ldr w9, [x9, #0x18] -> 0xb9401929
+#define RVA_INTERNAL_DRAW_TEXTURE       0x1A821F4 // UnityEngine.Graphics.Internal_DrawTexture
+
 // Native C++ functions của Unity engine (RVAs tĩnh trong binary)
 #define RVA_NATIVE_SCREEN_GET_WIDTH      0x2b360e4
 #define RVA_NATIVE_SCREEN_GET_HEIGHT     0x2b360f8
 #define RVA_NATIVE_GL_LOAD_MATRIX        0x2b364f0
 #define RVA_NATIVE_INTERNAL_DRAW_TEXTURE 0x2b36280
 #define RVA_NATIVE_GUICLIP_SET_MATRIX    0x23f1aa4
+
+// IL2CPP Engine internal routines
+#define RVA_IL2CPP_RESOLVE_TYPE          0x1E69B04
+#define RVA_IL2CPP_CLASS_INIT            0x1E69C58
+#define RVA_BATTLE_GET_MYPLAYER          0x296098
 
 // Cached Icall Slots trong phân vùng __DATA.__bss (Ghi đè trực tiếp an toàn tuyệt đối)
 #define OFF_ICALL_SCREEN_GET_WIDTH       0x4084f08
@@ -84,6 +96,7 @@ typedef struct {
 typedef struct Il2CppClass Il2CppClass;
 
 static int s_debugScanState = 0;
+static BOOL g_isInBattle = NO;
 
 // Function Pointers & Counters
 static uintptr_t unity_base = 0;
@@ -144,6 +157,71 @@ static inline bool safe_read(void *dst, const void *src, size_t size) {
     vm_size_t bytesRead = 0;
     kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t)p, size, (vm_address_t)dst, &bytesRead);
     return (kr == KERN_SUCCESS && bytesRead == size);
+}
+
+// ---------- Helper ghi đè lệnh máy (Hard Patch Code Instructions trong __TEXT) ----------
+static bool patch_code_instruction(void *addr, uint32_t instruction) {
+    if (!addr) return false;
+    mach_port_t task = mach_task_self();
+    vm_address_t page_start = (vm_address_t)addr & ~PAGE_MASK;
+    vm_size_t page_size = PAGE_SIZE;
+
+    kern_return_t kr = vm_protect(task, page_start, page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) {
+        NSLog(@"[MobiArmyMod] vm_protect (RW) thất bại tại %p: %d", addr, kr);
+        return false;
+    }
+
+    *(uint32_t *)addr = instruction;
+
+    vm_protect(task, page_start, page_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+    __builtin___clear_cache((char *)addr, (char *)addr + sizeof(uint32_t));
+    return true;
+}
+
+// ---------- Helper ghi đè một khối bytes trong code segment ----------
+static bool patch_code_bytes(void *addr, const void *bytes, size_t size) {
+    if (!addr || !bytes || size == 0) return false;
+    mach_port_t task = mach_task_self();
+    vm_address_t page_start = (vm_address_t)addr & ~PAGE_MASK;
+    vm_size_t page_offset = (vm_address_t)addr - page_start;
+    vm_size_t page_size = (page_offset + size + PAGE_SIZE - 1) & ~PAGE_MASK;
+
+    kern_return_t kr = vm_protect(task, page_start, page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) {
+        NSLog(@"[MobiArmyMod] vm_protect (RW) bytes thất bại tại %p: %d", addr, kr);
+        return false;
+    }
+
+    memcpy(addr, bytes, size);
+
+    vm_protect(task, page_start, page_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+    __builtin___clear_cache((char *)addr, (char *)addr + size);
+    return true;
+}
+
+// ---------- Helper phân giải metadata token của IL2CPP (Chống lazy init rỗng) ----------
+static void resolve_type_slot(uintptr_t base, uintptr_t offset) {
+    if (!base) return;
+    typedef void (*fn_resolve_t)(void *slot);
+    fn_resolve_t resolve = (fn_resolve_t)(base + RVA_IL2CPP_RESOLVE_TYPE);
+    @try {
+        resolve((void *)(base + offset));
+    } @catch (id ex) {}
+}
+
+// ---------- Helper kích hoạt runtime_class_init của IL2CPP (Tạo static_fields) ----------
+static void init_class(uintptr_t klass) {
+    if (!unity_base || klass < 0x100000000ULL || klass > 0x00007FFFFFFFFFFFULL) return;
+    uint32_t init_flag = 0;
+    if (safe_read(&init_flag, (const void *)(klass + 0xE4), sizeof(uint32_t)) && init_flag != 0) {
+        return; // Đã khởi tạo xong
+    }
+    typedef void (*fn_init_t)(void *klass);
+    fn_init_t init_fn = (fn_init_t)(unity_base + RVA_IL2CPP_CLASS_INIT);
+    @try {
+        init_fn((void *)klass);
+    } @catch (id ex) {}
 }
 
 // ---------- Helper tìm base UnityFramework ----------
@@ -264,10 +342,12 @@ static void my_icall_GLLoadPixelMatrixScript(float left, float right, float bott
 static void update_gamecanvas_dimensions(uintptr_t base) {
     if (!base) return;
     @try {
+        resolve_type_slot(base, OFF_GAMECANVAS_CLASS);
         uintptr_t canvasClass = 0;
         if (!safe_read(&canvasClass, (const void *)(base + OFF_GAMECANVAS_CLASS), sizeof(uintptr_t))) return;
         if (canvasClass < 0x100000000ULL || canvasClass > 0x00007FFFFFFFFFFFULL) return;
 
+        init_class(canvasClass);
         uintptr_t staticFields = 0;
         if (!safe_read(&staticFields, (const void *)(canvasClass + 0xA0), sizeof(uintptr_t))) return;
         if (staticFields < 0x100000000ULL || staticFields > 0x00007FFFFFFFFFFFULL) return;
@@ -282,29 +362,28 @@ static void update_gamecanvas_dimensions(uintptr_t base) {
         }
 
         if (s_baseCanvasW > 0) {
-            int32_t targetW = (int32_t)(s_baseCanvasW * g_zoomFactor);
-            int32_t targetH = (int32_t)(s_baseCanvasH * g_zoomFactor);
-            int32_t targetHW = targetW / 2;
-            int32_t targetHH = targetH / 2;
+            float zoomMul = (g_zoomFactor >= 1.5f) ? g_zoomFactor : 1.0f;
+            int32_t targetW = (int32_t)(s_baseCanvasW * zoomMul);
+            int32_t targetH = (int32_t)(s_baseCanvasH * zoomMul);
 
             *(int32_t *)(staticFields + 0x48) = targetW;
             *(int32_t *)(staticFields + 0x4C) = targetH;
-            *(int32_t *)(staticFields + 0x54) = targetHW;
-            *(int32_t *)(staticFields + 0x50) = targetHH;
+            *(int32_t *)(staticFields + 0x54) = targetW / 2;
+            *(int32_t *)(staticFields + 0x50) = targetH / 2;
         }
-    } @catch (id ex) {
-        // Safe fail
-    }
+    } @catch (id ex) {}
 }
 
 // Cập nhật hệ số scale gốc của mGraphics (0x3bb9230 + 0x18)
 static void update_graphics_scale(uintptr_t base) {
     if (!base) return;
     @try {
+        resolve_type_slot(base, OFF_SCALE_CLASS);
         uintptr_t scaleClass = 0;
         if (!safe_read(&scaleClass, (const void *)(base + OFF_SCALE_CLASS), sizeof(uintptr_t))) return;
         if (scaleClass < 0x100000000ULL || scaleClass > 0x00007FFFFFFFFFFFULL) return;
 
+        init_class(scaleClass);
         uintptr_t staticFields = 0;
         if (!safe_read(&staticFields, (const void *)(scaleClass + 0xA0), sizeof(uintptr_t))) return;
         if (staticFields < 0x100000000ULL || staticFields > 0x00007FFFFFFFFFFFULL) return;
@@ -315,14 +394,10 @@ static void update_graphics_scale(uintptr_t base) {
             s_origGraphicsScale = curScale;
         }
 
-        if (s_origGraphicsScale > 0) {
-            int32_t newScale = (int32_t)roundf((float)s_origGraphicsScale / g_zoomFactor);
-            if (newScale < 1) newScale = 1;
-            *(int32_t *)(staticFields + 0x18) = newScale;
-        }
-    } @catch (id ex) {
-        // Safe fail
-    }
+        // Khi zoom >= 1.5x, khóa scale cứng về 1
+        int32_t targetScale = (g_zoomFactor >= 1.4f) ? 1 : 2;
+        *(int32_t *)(staticFields + 0x18) = targetScale;
+    } @catch (id ex) {}
 }
 
 static int hook_Screen_getWidth(void) {
@@ -355,15 +430,52 @@ static void apply_icall_zoom_hooks(uintptr_t base) {
         *(uintptr_t *)(base + OFF_ICALL_INTERNAL_DRAW_TEXTURE)  = (uintptr_t)my_Internal_DrawTexture;
         *(uintptr_t *)(base + OFF_ICALL_GL_LOAD_MATRIX)         = (uintptr_t)my_icall_GLLoadPixelMatrixScript;
         *(uintptr_t *)(base + OFF_ICALL_GUICLIP_SET_MATRIX)     = (uintptr_t)my_GUIClip_SetMatrix;
+    } @catch (id ex) {}
+}
 
-        // Cập nhật canvas & scale ngay lập tức
-        update_gamecanvas_dimensions(base);
-        update_graphics_scale(base);
+// ==========================================
+// THỰC HIỆN HARD-PATCH MÃ MÁY ZOOM VÀO __TEXT
+// ==========================================
+static void apply_hard_patch_zoom(uintptr_t base) {
+    if (!base) return;
 
-        NSLog(@"[MobiArmyMod] Đã cài đặt zoom hooks (Internal_DrawTexture, GUIClip, Canvas, Scale) zoom=%.2fx", g_zoomFactor);
-    } @catch (id ex) {
-        NSLog(@"[MobiArmyMod] Lỗi apply_icall_zoom_hooks: %@", ex);
+    NSLog(@"[MobiArmyMod] >>> Áp dụng Hard-Patch Zoom (mức=%.2fx) <<<", g_zoomFactor);
+
+    if (g_zoomFactor >= 1.4f) {
+        // PATCH CỨNG: Ép scale = 1 ở tầng mã máy ARM64
+        // 1. mGraphics..cctor (0x194DEC): mov w9, #1 (0x52800029)
+        patch_code_instruction((void *)(base + RVA_MGRAPHICS_CCTOR_SCALE), 0x52800029);
+        // 2. mGraphics.drawRegion (0x18F15C): mov w8, #1 (0x52800028)
+        patch_code_instruction((void *)(base + RVA_MGRAPHICS_DRAWREGION_SCALE), 0x52800028);
+        // 3. Screen.getWidth (0xF3A8C): mov w9, #1 (0x52800029)
+        patch_code_instruction((void *)(base + RVA_GETWIDTH_SCALE), 0x52800029);
+        // 4. Screen.getHeight (0xF3B84): mov w9, #1 (0x52800029)
+        patch_code_instruction((void *)(base + RVA_GETHEIGHT_SCALE), 0x52800029);
+    } else {
+        // KHÔI PHỤC MÃ MÁY GỐC (2x)
+        // 1. mGraphics..cctor (0x194DEC): mov w9, #2 (0x52800049)
+        patch_code_instruction((void *)(base + RVA_MGRAPHICS_CCTOR_SCALE), 0x52800049);
+        // 2. mGraphics.drawRegion (0x18F15C): ldr w8, [x8, #0x18] (0xb9401908)
+        patch_code_instruction((void *)(base + RVA_MGRAPHICS_DRAWREGION_SCALE), 0xb9401908);
+        // 3. Screen.getWidth (0xF3A8C): ldr w9, [x9, #0x18] (0xb9401929)
+        patch_code_instruction((void *)(base + RVA_GETWIDTH_SCALE), 0xb9401929);
+        // 4. Screen.getHeight (0xF3B84): ldr w9, [x9, #0x18] (0xb9401929)
+        patch_code_instruction((void *)(base + RVA_GETHEIGHT_SCALE), 0xb9401929);
     }
+
+    // Direct inline hook trên UnityEngine.Graphics.Internal_DrawTexture (0x1A821F4)
+    uint32_t hook_code[4] = {
+        0x58000050, // ldr x16, #8
+        0xd61f0200, // br x16
+        (uint32_t)((uintptr_t)my_Internal_DrawTexture & 0xFFFFFFFF),
+        (uint32_t)(((uintptr_t)my_Internal_DrawTexture >> 32) & 0xFFFFFFFF)
+    };
+    patch_code_bytes((void *)(base + RVA_INTERNAL_DRAW_TEXTURE), hook_code, sizeof(hook_code));
+
+    // Luôn ghi đè icall slots và RAM static fields
+    apply_icall_zoom_hooks(base);
+    update_gamecanvas_dimensions(base);
+    update_graphics_scale(base);
 }
 
 // ==========================================
@@ -451,32 +563,29 @@ static void updateAimSolution(void) {
 // ==========================================
 // 3. QUÉT TRẬN ĐẤU AN TOÀN TUYỆT ĐỐI (ZERO CRASH)
 // ==========================================
-static uintptr_t resolve_class_ptr(uintptr_t base, uintptr_t offset) {
-    uintptr_t tokenPtr = 0;
-    if (safe_read(&tokenPtr, (const void *)(base + offset), sizeof(uintptr_t))) {
-        if (tokenPtr >= 0x100000000ULL && tokenPtr <= 0x00007FFFFFFFFFFFULL) {
-            return tokenPtr;
-        }
-    }
-    return 0;
-}
-
 static void scanBattleState(void) {
-    @try {
-        if (!unity_base) {
-            s_debugScanState = 0;
-            g_myPlayer = NULL;
-            g_enemyCount = 0;
-            return;
-        }
+    if (!unity_base) {
+        g_myPlayer = NULL;
+        g_enemyCount = 0;
+        g_isInBattle = NO;
+        return;
+    }
 
-        // 1. Kiểm tra GameController (0x3bb92d0)
-        uintptr_t gcClass = resolve_class_ptr(unity_base, OFF_GAMECONTROLLER_CLASS);
-        uintptr_t gcStatic = 0;
+    @try {
+        // 1. Resolve IL2CPP metadata tokens (Đảm bảo con trỏ không bị kẹt ở metadata token 0x2000xxxx)
+        resolve_type_slot(unity_base, OFF_BATTLE_MANAGER_CLASS);
+        resolve_type_slot(unity_base, OFF_GAMECONTROLLER_CLASS);
+        resolve_type_slot(unity_base, OFF_GAMECANVAS_CLASS);
+        resolve_type_slot(unity_base, OFF_SCALE_CLASS);
+
+        // 2. Đọc GameController state (isInBattle, myIdx)
         uint8_t isInBattle = 0;
         int8_t myIdx = -1;
-
-        if (gcClass) {
+        uintptr_t gcClass = 0;
+        safe_read(&gcClass, (const void *)(unity_base + OFF_GAMECONTROLLER_CLASS), sizeof(uintptr_t));
+        if (gcClass >= 0x100000000ULL && gcClass <= 0x00007FFFFFFFFFFFULL) {
+            init_class(gcClass);
+            uintptr_t gcStatic = 0;
             safe_read(&gcStatic, (const void *)(gcClass + 0xA0), sizeof(uintptr_t));
             if (gcStatic >= 0x100000000ULL && gcStatic <= 0x00007FFFFFFFFFFFULL) {
                 safe_read(&isInBattle, (const void *)(gcStatic + 0x2E0), sizeof(uint8_t));
@@ -484,95 +593,70 @@ static void scanBattleState(void) {
             }
         }
 
-        // 2. Kiểm tra BattleManager (0x3bb9190)
-        uintptr_t bmClass = resolve_class_ptr(unity_base, OFF_BATTLE_MANAGER_CLASS);
-        uintptr_t bmStatic = 0;
-        if (bmClass) {
-            safe_read(&bmStatic, (const void *)(bmClass + 0xA0), sizeof(uintptr_t));
+        // 3. Gọi trực tiếp hàm engine BattleManager.get_myPlayer (0x296098)
+        void *myPlayer = NULL;
+        typedef void *(*fn_get_myplayer_t)(void);
+        fn_get_myplayer_t get_myplayer = (fn_get_myplayer_t)(unity_base + RVA_BATTLE_GET_MYPLAYER);
+        @try {
+            void *res = get_myplayer();
+            if ((uintptr_t)res >= 0x100000000ULL && (uintptr_t)res <= 0x00007FFFFFFFFFFFULL) {
+                myPlayer = res;
+            }
+        } @catch (id ex) {
+            myPlayer = NULL;
         }
 
-        // 3. Tìm mảng playerArray trong static_fields
+        // 4. Lấy allPlayers array từ BattleManager.static_fields + 0x8
         uintptr_t playerArray = 0;
         int32_t count = 0;
-
-        // Ưu tiên đọc từ BattleManager static_fields + 0x8 (mảng allPlayers)
-        if (bmStatic >= 0x100000000ULL && bmStatic <= 0x00007FFFFFFFFFFFULL) {
-            size_t offsets[] = { 0x8, 0x10, 0x0, 0x18, 0x20 };
-            for (int i = 0; i < 5; i++) {
-                uintptr_t cand = 0;
-                if (safe_read(&cand, (const void *)(bmStatic + offsets[i]), sizeof(uintptr_t)) &&
-                    cand >= 0x100000000ULL && cand <= 0x00007FFFFFFFFFFFULL) {
-                    int32_t testCount = 0;
-                    if (safe_read(&testCount, (const void *)(cand + 0x18), sizeof(int32_t)) &&
-                        testCount >= 1 && testCount <= 32) {
-                        for (int k = 0; k < testCount; k++) {
-                            uintptr_t elem = 0;
-                            if (safe_read(&elem, (const void *)(cand + 0x20 + (size_t)k * 8), sizeof(uintptr_t)) &&
-                                elem >= 0x100000000ULL && elem <= 0x00007FFFFFFFFFFFULL) {
-                                playerArray = cand;
-                                count = testCount;
-                                break;
-                            }
-                        }
-                        if (playerArray) break;
+        uintptr_t bmClass = 0;
+        safe_read(&bmClass, (const void *)(unity_base + OFF_BATTLE_MANAGER_CLASS), sizeof(uintptr_t));
+        if (bmClass >= 0x100000000ULL && bmClass <= 0x00007FFFFFFFFFFFULL) {
+            init_class(bmClass);
+            uintptr_t bmStatic = 0;
+            safe_read(&bmStatic, (const void *)(bmClass + 0xA0), sizeof(uintptr_t));
+            if (bmStatic >= 0x100000000ULL && bmStatic <= 0x00007FFFFFFFFFFFULL) {
+                uintptr_t arr = 0;
+                if (safe_read(&arr, (const void *)(bmStatic + 0x8), sizeof(uintptr_t)) &&
+                    arr >= 0x100000000ULL && arr <= 0x00007FFFFFFFFFFFULL) {
+                    int32_t len = 0;
+                    if (safe_read(&len, (const void *)(arr + 0x18), sizeof(int32_t)) &&
+                        len >= 1 && len <= 32) {
+                        playerArray = arr;
+                        count = len;
                     }
                 }
             }
         }
 
-        // Nếu chưa thấy, quét tiếp trong GameController static_fields
-        if (!playerArray && gcStatic >= 0x100000000ULL && gcStatic <= 0x00007FFFFFFFFFFFULL) {
-            size_t offsets[] = { 0x1A0, 0x1C8, 0x200, 0x2F8, 0x8, 0x10 };
-            for (int i = 0; i < 6; i++) {
-                uintptr_t cand = 0;
-                if (safe_read(&cand, (const void *)(gcStatic + offsets[i]), sizeof(uintptr_t)) &&
-                    cand >= 0x100000000ULL && cand <= 0x00007FFFFFFFFFFFULL) {
-                    int32_t testCount = 0;
-                    if (safe_read(&testCount, (const void *)(cand + 0x18), sizeof(int32_t)) &&
-                        testCount >= 1 && testCount <= 32) {
-                        for (int k = 0; k < testCount; k++) {
-                            uintptr_t elem = 0;
-                            if (safe_read(&elem, (const void *)(cand + 0x20 + (size_t)k * 8), sizeof(uintptr_t)) &&
-                                elem >= 0x100000000ULL && elem <= 0x00007FFFFFFFFFFFULL) {
-                                playerArray = cand;
-                                count = testCount;
-                                break;
-                            }
-                        }
-                        if (playerArray) break;
-                    }
-                }
-            }
-        }
-
-        if (!playerArray || count <= 0) {
-            s_debugScanState = (isInBattle == 1) ? 4 : 5;
-            g_myPlayer = NULL;
-            g_enemyCount = 0;
-            return;
-        }
-
-        // 4. Tìm nhân vật của mình (myPlayer)
-        void *myPlayer = NULL;
-
-        // Cách 1: Theo myIdx từ GameController
-        if (myIdx >= 0 && myIdx < count) {
-            uintptr_t p = 0;
-            if (safe_read(&p, (const void *)(playerArray + 0x20 + (size_t)myIdx * 8), sizeof(uintptr_t)) &&
-                p >= 0x100000000ULL && p <= 0x00007FFFFFFFFFFFULL) {
-                myPlayer = (void *)p;
-            }
-        }
-
-        // Cách 2: Quét flag isMe == 1
-        if (!myPlayer) {
-            for (int i = 0; i < count; i++) {
+        // 5. Nếu chưa có myPlayer từ get_myPlayer(), quét trong playerArray
+        if (!myPlayer && playerArray && count > 0) {
+            if (myIdx >= 0 && myIdx < count) {
                 uintptr_t p = 0;
-                if (safe_read(&p, (const void *)(playerArray + 0x20 + (size_t)i * 8), sizeof(uintptr_t)) &&
+                if (safe_read(&p, (const void *)(playerArray + 0x20 + (size_t)myIdx * 8), sizeof(uintptr_t)) &&
                     p >= 0x100000000ULL && p <= 0x00007FFFFFFFFFFFULL) {
-                    uint8_t isMe = 0;
-                    safe_read(&isMe, (const void *)(p + OFF_PLAYER_IS_ME), sizeof(uint8_t));
-                    if (isMe) {
+                    myPlayer = (void *)p;
+                }
+            }
+            if (!myPlayer) {
+                for (int i = 0; i < count; i++) {
+                    uintptr_t p = 0;
+                    if (safe_read(&p, (const void *)(playerArray + 0x20 + (size_t)i * 8), sizeof(uintptr_t)) &&
+                        p >= 0x100000000ULL && p <= 0x00007FFFFFFFFFFFULL) {
+                        uint8_t isMe = 0;
+                        safe_read(&isMe, (const void *)(p + OFF_PLAYER_IS_ME), sizeof(uint8_t));
+                        if (isMe) {
+                            myPlayer = (void *)p;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!myPlayer && isInBattle == 1) {
+                for (int i = 0; i < count; i++) {
+                    uintptr_t p = 0;
+                    if (safe_read(&p, (const void *)(playerArray + 0x20 + (size_t)i * 8), sizeof(uintptr_t)) &&
+                        p >= 0x100000000ULL && p <= 0x00007FFFFFFFFFFFULL) {
                         myPlayer = (void *)p;
                         break;
                     }
@@ -580,53 +664,34 @@ static void scanBattleState(void) {
             }
         }
 
-        // Cách 3: Gọi hàm engine BattleManager::get_myPlayer (0x296098) nếu đang trong trận
-        if (!myPlayer && isInBattle) {
-            typedef void *(*fn_get_myplayer_t)(void);
-            fn_get_myplayer_t get_myplayer = (fn_get_myplayer_t)(unity_base + 0x296098);
-            @try {
-                void *res = get_myplayer();
-                if ((uintptr_t)res >= 0x100000000ULL && (uintptr_t)res <= 0x00007FFFFFFFFFFFULL) {
-                    myPlayer = res;
-                }
-            } @catch (id ex) {}
-        }
+        // 6. Kiểm tra trạng thái vào trận:
+        // Đã vào trận nếu: myPlayer != NULL HOẶC isInBattle == 1 HOẶC (count > 0 && playerArray != 0)
+        BOOL inMatch = (myPlayer != NULL) || (isInBattle == 1) || (count > 0);
+        g_isInBattle = inMatch;
 
-        // Cách 4: Lấy player hợp lệ đầu tiên nếu đang trong trận
-        if (!myPlayer && isInBattle) {
-            for (int i = 0; i < count; i++) {
-                uintptr_t p = 0;
-                if (safe_read(&p, (const void *)(playerArray + 0x20 + (size_t)i * 8), sizeof(uintptr_t)) &&
-                    p >= 0x100000000ULL && p <= 0x00007FFFFFFFFFFFULL) {
-                    myPlayer = (void *)p;
-                    break;
-                }
-            }
-        }
-
-        if (!myPlayer) {
-            s_debugScanState = 5;
+        if (!inMatch) {
             g_myPlayer = NULL;
             g_enemyCount = 0;
             return;
         }
 
-        s_debugScanState = 6; // ĐÃ VÀO TRẬN ĐẤU THÀNH CÔNG!
         g_myPlayer = myPlayer;
         g_battleUpdateCount++;
 
         // Đọc toạ độ của bản thân
         int32_t mx = 0, my = 0;
         int8_t mteam = 0;
-        safe_read(&mx, (const void *)((uintptr_t)myPlayer + OFF_PLAYER_X), sizeof(int32_t));
-        safe_read(&my, (const void *)((uintptr_t)myPlayer + OFF_PLAYER_Y), sizeof(int32_t));
-        safe_read(&mteam, (const void *)((uintptr_t)myPlayer + OFF_PLAYER_TEAM), sizeof(int8_t));
-        if (mx == 0 && my == 0) {
-            float fx = 0, fy = 0;
-            safe_read(&fx, (const void *)((uintptr_t)myPlayer + OFF_PLAYER_CUR_X), sizeof(float));
-            safe_read(&fy, (const void *)((uintptr_t)myPlayer + OFF_PLAYER_CUR_Y), sizeof(float));
-            mx = (int32_t)fx;
-            my = (int32_t)fy;
+        if (myPlayer) {
+            safe_read(&mx, (const void *)((uintptr_t)myPlayer + OFF_PLAYER_X), sizeof(int32_t));
+            safe_read(&my, (const void *)((uintptr_t)myPlayer + OFF_PLAYER_Y), sizeof(int32_t));
+            safe_read(&mteam, (const void *)((uintptr_t)myPlayer + OFF_PLAYER_TEAM), sizeof(int8_t));
+            if (mx == 0 && my == 0) {
+                float fx = 0, fy = 0;
+                safe_read(&fx, (const void *)((uintptr_t)myPlayer + OFF_PLAYER_CUR_X), sizeof(float));
+                safe_read(&fy, (const void *)((uintptr_t)myPlayer + OFF_PLAYER_CUR_Y), sizeof(float));
+                mx = (int32_t)fx;
+                my = (int32_t)fy;
+            }
         }
         g_lastMyX = mx;
         g_lastMyY = my;
@@ -636,48 +701,50 @@ static void scanBattleState(void) {
         int activeEnemyCount = 0;
         EnemyTarget tempEnemies[MAX_TARGETS];
 
-        for (int i = 0; i < count && activeEnemyCount < MAX_TARGETS; i++) {
-            uintptr_t pPtr = 0;
-            safe_read(&pPtr, (const void *)(playerArray + 0x20 + (size_t)i * 8), sizeof(uintptr_t));
-            if (!pPtr || pPtr < 0x100000000ULL || (void *)pPtr == myPlayer) continue;
+        if (playerArray && count > 0) {
+            for (int i = 0; i < count && activeEnemyCount < MAX_TARGETS; i++) {
+                uintptr_t pPtr = 0;
+                safe_read(&pPtr, (const void *)(playerArray + 0x20 + (size_t)i * 8), sizeof(uintptr_t));
+                if (!pPtr || pPtr < 0x100000000ULL || (void *)pPtr == myPlayer) continue;
 
-            uint8_t isMe = 0;
-            safe_read(&isMe, (const void *)(pPtr + OFF_PLAYER_IS_ME), sizeof(uint8_t));
-            if (isMe) continue;
+                uint8_t isMe = 0;
+                safe_read(&isMe, (const void *)(pPtr + OFF_PLAYER_IS_ME), sizeof(uint8_t));
+                if (isMe) continue;
 
-            int8_t team = 0;
-            int32_t hp = 0, px = 0, py = 0, pid = 0;
-            safe_read(&team, (const void *)(pPtr + OFF_PLAYER_TEAM), sizeof(int8_t));
-            safe_read(&hp, (const void *)(pPtr + OFF_PLAYER_HP), sizeof(int32_t));
-            safe_read(&px, (const void *)(pPtr + OFF_PLAYER_X), sizeof(int32_t));
-            safe_read(&py, (const void *)(pPtr + OFF_PLAYER_Y), sizeof(int32_t));
-            safe_read(&pid, (const void *)(pPtr + OFF_PLAYER_ID), sizeof(int32_t));
+                int8_t team = 0;
+                int32_t hp = 0, px = 0, py = 0, pid = 0;
+                safe_read(&team, (const void *)(pPtr + OFF_PLAYER_TEAM), sizeof(int8_t));
+                safe_read(&hp, (const void *)(pPtr + OFF_PLAYER_HP), sizeof(int32_t));
+                safe_read(&px, (const void *)(pPtr + OFF_PLAYER_X), sizeof(int32_t));
+                safe_read(&py, (const void *)(pPtr + OFF_PLAYER_Y), sizeof(int32_t));
+                safe_read(&pid, (const void *)(pPtr + OFF_PLAYER_ID), sizeof(int32_t));
 
-            if (px == 0 && py == 0) {
-                float fx = 0, fy = 0;
-                safe_read(&fx, (const void *)(pPtr + OFF_PLAYER_CUR_X), sizeof(float));
-                safe_read(&fy, (const void *)(pPtr + OFF_PLAYER_CUR_Y), sizeof(float));
-                px = (int32_t)fx;
-                py = (int32_t)fy;
+                if (px == 0 && py == 0) {
+                    float fx = 0, fy = 0;
+                    safe_read(&fx, (const void *)(pPtr + OFF_PLAYER_CUR_X), sizeof(float));
+                    safe_read(&fy, (const void *)(pPtr + OFF_PLAYER_CUR_Y), sizeof(float));
+                    px = (int32_t)fx;
+                    py = (int32_t)fy;
+                }
+
+                if (mteam != 0 && team == mteam) continue;
+
+                EnemyTarget en;
+                en.id = pid != 0 ? pid : (int32_t)(i + 1);
+                en.x = px;
+                en.y = py;
+                en.hp = hp;
+                en.team = team;
+                float dx = (float)(px - mx);
+                float dy = (float)(py - my);
+                en.distance = sqrtf(dx * dx + dy * dy);
+                if (hp > 0) {
+                    snprintf(en.name, sizeof(en.name), "Địch #%d (HP:%d)", en.id, hp);
+                } else {
+                    snprintf(en.name, sizeof(en.name), "Địch #%d (%d,%d)", en.id, px, py);
+                }
+                tempEnemies[activeEnemyCount++] = en;
             }
-
-            if (mteam != 0 && team == mteam) continue;
-
-            EnemyTarget en;
-            en.id = pid != 0 ? pid : (int32_t)(i + 1);
-            en.x = px;
-            en.y = py;
-            en.hp = hp;
-            en.team = team;
-            float dx = (float)(px - mx);
-            float dy = (float)(py - my);
-            en.distance = sqrtf(dx * dx + dy * dy);
-            if (hp > 0) {
-                snprintf(en.name, sizeof(en.name), "Địch #%d (HP:%d)", en.id, hp);
-            } else {
-                snprintf(en.name, sizeof(en.name), "Địch #%d (%d,%d)", en.id, px, py);
-            }
-            tempEnemies[activeEnemyCount++] = en;
         }
 
         g_enemyCount = activeEnemyCount;
@@ -815,7 +882,7 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
 
     // Zoom Factor
     UILabel *zoomTitle = [[UILabel alloc] initWithFrame:CGRectMake(16, curY, 200, 18)];
-    zoomTitle.text = @"MỨC ZOOM BẢN ĐỒ (SIÊU RỘNG):";
+    zoomTitle.text = @"MỨC ZOOM BẢN ĐỒ (PATCH CỨNG):";
     zoomTitle.font = [UIFont boldSystemFontOfSize:11];
     zoomTitle.textColor = [UIColor colorWithWhite:0.75 alpha:1.0];
     [self.panelView addSubview:zoomTitle];
@@ -898,6 +965,7 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
     self.statusLabel.textColor = [UIColor colorWithWhite:0.7 alpha:1.0];
     self.statusLabel.textAlignment = NSTextAlignmentCenter;
     [teleBox addSubview:self.statusLabel];
+
     [self.panelView addSubview:teleBox];
     curY += 60;
 
@@ -971,11 +1039,8 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
             g_zoomFactor = values[sender.selectedSegmentIndex];
         }
         if (unity_base) {
-            apply_icall_zoom_hooks(unity_base);
-            update_gamecanvas_dimensions(unity_base);
-            update_graphics_scale(unity_base);
+            apply_hard_patch_zoom(unity_base);
         }
-        // ZERO CRASH: Tuyệt đối không gọi real_Screen_SetResolution gây crash Metal swapchain
         [self refreshUI];
     } @catch (id ex) {
         NSLog(@"[MobiArmyMod] Lỗi onZoomChanged: %@", ex);
@@ -1031,21 +1096,13 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
 
         scanBattleState();
 
-        BOOL inBattle = (g_myPlayer != NULL);
+        BOOL inBattle = g_isInBattle || (g_myPlayer != NULL) || (g_enemyCount > 0);
 
         if (!inBattle) {
             self.targetInfoLabel.text = @"Chưa vào trận đấu";
             self.targetInfoLabel.textColor = [UIColor yellowColor];
             self.aimInfoLabel.text = @"Góc: --°  |  Lực: --";
-
-            const char *stateDesc = "Đang tìm game...";
-            if (s_debugScanState == 1) stateDesc = "Đang kết nối Unity domain...";
-            else if (s_debugScanState == 2) stateDesc = "Đang nạp Assembly-CSharp...";
-            else if (s_debugScanState == 3) stateDesc = "Chờ BattleManager...";
-            else if (s_debugScanState == 4) stateDesc = "Đang tải trận...";
-            else if (s_debugScanState == 5) stateDesc = "Sẵn sàng (Vào trận để quét)...";
-
-            self.statusLabel.text = [NSString stringWithFormat:@"Zoom: %.1fx | %s", g_zoomFactor, stateDesc];
+            self.statusLabel.text = [NSString stringWithFormat:@"Zoom: %.1fx (Hard-Patched) | Sẵn sàng...", g_zoomFactor];
             return;
         }
 
@@ -1091,10 +1148,10 @@ static void install_hooks(void) {
         if (!base) return;
         unity_base = base;
 
-        NSLog(@"[MobiArmyMod] Bắt đầu cài đặt Hooks vào UnityFramework (0x%lx)...", base);
+        NSLog(@"[MobiArmyMod] Bắt đầu cài đặt Hard Patch & Hooks vào UnityFramework (0x%lx)...", base);
 
-        // 1. Áp dụng hook zoom Icall slots trong __DATA.__bss & GameCanvas & Scale
-        apply_icall_zoom_hooks(base);
+        // 1. Áp dụng Hard-Patch Zoom (Mã máy + Icall slots + Canvas + Scale)
+        apply_hard_patch_zoom(base);
 
         // 2. Hook qua MSHookFunction nếu có Substrate/Ellekit (Dopamine / Sileo)
         void (*fn_MSHook)(void *, void *, void **) = (void (*)(void *, void *, void **))dlsym(RTLD_DEFAULT, "MSHookFunction");
@@ -1116,7 +1173,7 @@ static void on_image_loaded(const struct mach_header *mh, intptr_t vmaddr_slide)
         if (strstr(info.dli_fname, "UnityFramework")) {
             NSLog(@"[MobiArmyMod] UnityFramework phát hiện qua dyld tại %p (slide 0x%lx)", mh, vmaddr_slide);
             unity_base = (uintptr_t)mh;
-            apply_icall_zoom_hooks(unity_base);
+            apply_hard_patch_zoom(unity_base);
         }
     }
 }
@@ -1126,7 +1183,7 @@ __attribute__((constructor)) static void MobiArmyModInit(void) {
 
     uintptr_t base = find_unity_base();
     if (base) {
-        apply_icall_zoom_hooks(base);
+        apply_hard_patch_zoom(base);
     }
 
     _dyld_register_func_for_add_image(on_image_loaded);
