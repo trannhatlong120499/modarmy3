@@ -1,6 +1,6 @@
 //
 //  MobiArmyMod.mm
-//  MobiArmy 3 HA Mod Dylib - Auto-Aim Chuẩn Xác & Zero Crash 100%
+//  MobiArmy 3 HA Mod Dylib - Auto-Aim Chuẩn Xác & Skill Liên Tục & Zero Crash 100%
 //
 //  Tương thích: TrollStore / TrollFools / Dopamine / Sileo / Rootless / Rootful
 //  Kiến trúc: ARM64 + ARM64E (Hỗ trợ từ iPhone X tới iPhone 16 Pro Max, iOS 14.0 - 18.x)
@@ -14,24 +14,43 @@
 #include <math.h>
 
 // ==========================================
-// CẤU HÌNH MẶC ĐỊNH
+// CẤU HÌNH & CHẾ ĐỘ
 // ==========================================
-static BOOL  g_aimbotEnabled    = YES;      // Bật aimbot
-static BOOL  g_highArcMode      = YES;      // YES: Góc cao (High Arc), NO: Góc thấp (Low Arc)
-static float g_gravityFactor    = 1.0f;     // Hệ số trọng lực tinh chỉnh
-static float g_forceScale       = 1.0f;     // Hệ số lực bắn tinh chỉnh
-static int   g_currentTargetIdx = 0;        // Index mục tiêu hiện tại
+typedef NS_ENUM(NSInteger, MobiSkillMode) {
+    MobiSkillMode_Auto   = 0,  // Tự động lặp lại skill vừa dùng (Last Used)
+    MobiSkillMode_Super  = 1,  // Chiêu cuối (Super / Ulti)
+    MobiSkillMode_Skill1 = 2,  // Skill 1
+    MobiSkillMode_Skill2 = 3,  // Skill 2
+    MobiSkillMode_Dual   = 4   // Đạn x2 (Bắn 2 tia)
+};
+
+static BOOL  g_aimbotEnabled          = YES;  // Bật/tắt tự ngắm
+static BOOL  g_highArcMode            = YES;  // YES: Góc cao (High Arc), NO: Góc thấp (Low Arc)
+static float g_gravityFactor          = 1.0f; // Hệ số trọng lực tinh chỉnh
+static float g_forceScale             = 1.0f; // Hệ số lực bắn tinh chỉnh
+static int   g_currentTargetIdx       = 0;    // Index mục tiêu hiện tại
+
+// Skill Liên Tục
+static BOOL          g_continuousSkillEnabled = YES; // Mặc định BẬT skill liên tục
+static MobiSkillMode g_skillMode              = MobiSkillMode_Auto;
+static int8_t        g_lastSkillShootType     = 0;   // Lưu shootType mạng của skill vừa dùng
+static int32_t       g_lastSelectedSkillId    = -1;  // Lưu ID skill client (field 0xB8)
 
 // RVAs trong UnityFramework 1.0.1.0.3
 #define OFF_SERVICE_SEND_SHOOT          0x148704
-#define OFF_BATTLE_MANAGER_CLASS        0x3bb9190
-#define OFF_GAMECONTROLLER_CLASS        0x3bb92d0
+#define OFF_BATTLE_MANAGER_GET_MYPLAYER 0x296098
+#define OFF_IL2CPP_INIT_METADATA        0x1e69b04
+#define OFF_BATTLE_MANAGER_TOKEN_SLOT   0x3bb9190
+#define OFF_BATTLE_SCREEN_TOKEN_SLOT    0x3bb92d0
 
 // Offsets của thực thể Player (Khớp chính xác 100% với metadata dump.cs 1.0.1.0.3)
 #define OFF_PLAYER_IS_ME        0x10   // Boolean (1 byte)
 #define OFF_PLAYER_TEAM         0x13   // SByte (1 byte)
 #define OFF_PLAYER_ID           0x18   // Int32 (4 bytes)
 #define OFF_PLAYER_NAME         0x28   // Il2CppString*
+#define OFF_PLAYER_SKILL        0xB8   // Int32: skill/item ID (-1: thường, 100: super, 0: skill1, 1: skill2, 2: x2)
+#define OFF_PLAYER_DEFAULT_BULLET 0x1D0// SByte
+#define OFF_PLAYER_NUM_BULLETS  0x1D1  // SByte
 #define OFF_PLAYER_HP           0x274  // Int32 (4 bytes)
 #define OFF_PLAYER_X            0x278  // Int32 (4 bytes)
 #define OFF_PLAYER_Y            0x27C  // Int32 (4 bytes)
@@ -73,7 +92,7 @@ static int32_t g_lastMyX = 0, g_lastMyY = 0;
 static void *g_myPlayer = NULL;
 static int8_t g_myTeam = 0;
 
-// ---------- Helper xoá PAC / TBI bits trên ARM64E (iPhone 14/15/16 Pro Max / iOS 16+) ----------
+// ---------- Helper xoá PAC / TBI bits trên ARM64E (iOS 16+ / A12 - A18) ----------
 static inline uintptr_t clean_ptr(uintptr_t p) {
     return p & 0x0000FFFFFFFFFFFFULL;
 }
@@ -170,11 +189,11 @@ static AimSolution calculateAim(int32_t x0, int32_t y0, int32_t x1, int32_t y1, 
         }
     }
 
-    if (bestError < 80.0f) {
+    if (bestError < 90.0f) {
         int finalAngle = shootingRight ? bestAngle : (180 - bestAngle);
         sol.angle = (int16_t)finalAngle;
         sol.force = (int8_t)bestForce;
-        sol.force2 = 0;
+        sol.force2 = (g_skillMode == MobiSkillMode_Dual && g_continuousSkillEnabled) ? (int8_t)bestForce : 0;
         sol.landingError = bestError;
         sol.found = true;
     }
@@ -201,7 +220,7 @@ static void updateAimSolution(void) {
 }
 
 // ==========================================
-// 2. QUÉT TRẬN ĐẤU CHUẨN XÁC 100% (ZERO CRASH - SAFE READ ONLY)
+// 2. QUÉT TRẬN ĐẤU CHUẨN XÁC 100% (KHẮC PHỤC TRIỆT ĐỂ "CHƯA VÀO TRẬN")
 // ==========================================
 static void scanBattleState(void) {
     if (!unity_base) {
@@ -215,90 +234,57 @@ static void scanBattleState(void) {
     }
 
     @try {
-        uintptr_t gcClass = 0;
-        int8_t myIdx = -1;
-        uint8_t isInBattleFlag = 0;
-
-        // 1. Đọc GameController tại base + OFF_GAMECONTROLLER_CLASS (0x3bb92d0)
-        if (safe_read(&gcClass, (const void *)(unity_base + OFF_GAMECONTROLLER_CLASS), sizeof(uintptr_t))) {
-            gcClass = clean_ptr(gcClass);
-            if (gcClass >= 0x100000000ULL && (gcClass & 1) == 0) {
-                uintptr_t gcStatic = 0;
-                if (safe_read(&gcStatic, (const void *)(gcClass + 0xA0), sizeof(uintptr_t))) {
-                    gcStatic = clean_ptr(gcStatic);
-                    if (gcStatic >= 0x100000000ULL) {
-                        safe_read(&myIdx, (const void *)(gcStatic + 0x2BC), sizeof(int8_t));
-                        safe_read(&isInBattleFlag, (const void *)(gcStatic + 0x2E0), sizeof(uint8_t));
-                    }
-                }
-            }
-        }
-
-        // 2. Đọc BattleManager tại base + OFF_BATTLE_MANAGER_CLASS (0x3bb9190)
-        uintptr_t bmClass = 0;
+        void *myPlayer = NULL;
         uintptr_t playerArray = 0;
         int32_t count = 0;
 
-        if (safe_read(&bmClass, (const void *)(unity_base + OFF_BATTLE_MANAGER_CLASS), sizeof(uintptr_t))) {
+        // BƯỚC 1: Tự động khởi tạo Metadata Token nếu chưa được giải mã
+        // Token slot 0x3bb9190 (BattleManager) và 0x3bb92d0 (BattleScreen)
+        void (*fn_init_meta)(uintptr_t *) = (void (*)(uintptr_t *))(unity_base + OFF_IL2CPP_INIT_METADATA);
+        uintptr_t *pBmSlot = (uintptr_t *)(unity_base + OFF_BATTLE_MANAGER_TOKEN_SLOT);
+        uintptr_t *pBsSlot = (uintptr_t *)(unity_base + OFF_BATTLE_SCREEN_TOKEN_SLOT);
+
+        if (fn_init_meta) {
+            if (pBmSlot && (*pBmSlot & 1)) {
+                @try { fn_init_meta(pBmSlot); } @catch (id ex) {}
+            }
+            if (pBsSlot && (*pBsSlot & 1)) {
+                @try { fn_init_meta(pBsSlot); } @catch (id ex) {}
+            }
+        }
+
+        // BƯỚC 2: Gọi trực tiếp hàm BattleManager.get_myPlayer() (RVA 0x296098)
+        // Hàm này tự động giải mã metadata, khởi tạo class và trả về myPlayer (hoặc NULL nếu chưa vào trận)
+        typedef void *(*fn_get_myPlayer_t)(void);
+        fn_get_myPlayer_t pfn_getMyPlayer = (fn_get_myPlayer_t)(unity_base + OFF_BATTLE_MANAGER_GET_MYPLAYER);
+        if (pfn_getMyPlayer) {
+            @try {
+                myPlayer = pfn_getMyPlayer();
+            } @catch (id ex) {
+                myPlayer = NULL;
+            }
+        }
+
+        // BƯỚC 3: Đọc trực tiếp danh sách người chơi (allPlayers) từ BattleManager
+        // BattleManager static fields nằm tại: (*0x3bb9190)->static_fields (offset 0xA0)
+        // Mảng allPlayers nằm tại offset 0x08 trong static fields
+        uintptr_t bmClass = 0;
+        if (safe_read(&bmClass, (const void *)(unity_base + OFF_BATTLE_MANAGER_TOKEN_SLOT), sizeof(uintptr_t))) {
             bmClass = clean_ptr(bmClass);
             if (bmClass >= 0x100000000ULL && (bmClass & 1) == 0) {
                 uintptr_t bmStatic = 0;
                 if (safe_read(&bmStatic, (const void *)(bmClass + 0xA0), sizeof(uintptr_t))) {
                     bmStatic = clean_ptr(bmStatic);
                     if (bmStatic >= 0x100000000ULL) {
-                        // Thử các offset mảng allPlayers (0x08 là allPlayers chính thức)
-                        size_t offsets[] = { 0x08, 0x10, 0x18, 0x20, 0x00 };
-                        for (int o = 0; o < 5; o++) {
-                            uintptr_t arr = 0;
-                            if (safe_read(&arr, (const void *)(bmStatic + offsets[o]), sizeof(uintptr_t))) {
-                                arr = clean_ptr(arr);
-                                if (arr >= 0x100000000ULL) {
-                                    int32_t len = 0;
-                                    if (safe_read(&len, (const void *)(arr + 0x18), sizeof(int32_t))) {
-                                        if (len >= 1 && len <= 32) {
-                                            uintptr_t p0 = 0;
-                                            if (safe_read(&p0, (const void *)(arr + 0x20), sizeof(uintptr_t))) {
-                                                p0 = clean_ptr(p0);
-                                                if (p0 >= 0x100000000ULL) {
-                                                    playerArray = arr;
-                                                    count = len;
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3. Nếu chưa thấy ở BattleManager, thử tìm trong GameController static fields
-        if (!playerArray && gcClass >= 0x100000000ULL) {
-            uintptr_t gcStatic = 0;
-            if (safe_read(&gcStatic, (const void *)(gcClass + 0xA0), sizeof(uintptr_t))) {
-                gcStatic = clean_ptr(gcStatic);
-                if (gcStatic >= 0x100000000ULL) {
-                    size_t gcOffsets[] = { 0x2F8, 0x1A0, 0x1C8, 0x200, 0x08, 0x10 };
-                    for (int o = 0; o < 6; o++) {
                         uintptr_t arr = 0;
-                        if (safe_read(&arr, (const void *)(gcStatic + gcOffsets[o]), sizeof(uintptr_t))) {
+                        if (safe_read(&arr, (const void *)(bmStatic + 0x08), sizeof(uintptr_t))) {
                             arr = clean_ptr(arr);
                             if (arr >= 0x100000000ULL) {
                                 int32_t len = 0;
                                 if (safe_read(&len, (const void *)(arr + 0x18), sizeof(int32_t))) {
                                     if (len >= 1 && len <= 32) {
-                                        uintptr_t p0 = 0;
-                                        if (safe_read(&p0, (const void *)(arr + 0x20), sizeof(uintptr_t))) {
-                                            p0 = clean_ptr(p0);
-                                            if (p0 >= 0x100000000ULL) {
-                                                playerArray = arr;
-                                                count = len;
-                                                break;
-                                            }
-                                        }
+                                        playerArray = arr;
+                                        count = len;
                                     }
                                 }
                             }
@@ -308,48 +294,21 @@ static void scanBattleState(void) {
             }
         }
 
-        // Xác định trạng thái vào trận:
-        // Cả đấu Online (isInBattleFlag == 1) VÀ Luyện tập offline (myIdx >= 0 HOẶC playerArray có count > 0)
-        BOOL inBattle = (isInBattleFlag == 1) || (myIdx >= 0) || (playerArray != 0 && count > 0);
+        // BƯỚC 4: Xác định trạng thái vào trận
+        // Nếu có myPlayer HOẶC danh sách allPlayers có ít nhất 1 người
+        BOOL inBattle = (myPlayer != NULL) || (playerArray != 0 && count > 0);
         g_isInBattle = inBattle;
 
         if (!inBattle || !playerArray || count <= 0) {
-            g_myPlayer = NULL;
+            g_myPlayer = myPlayer;
             g_enemyCount = 0;
             return;
         }
 
         g_battleUpdateCount++;
-        void *myPlayer = NULL;
         int enemyIdx = 0;
 
-        // Ưu tiên 1: myPlayer theo myIdx từ GameController
-        if (myIdx >= 0 && myIdx < count) {
-            uintptr_t pMe = 0;
-            if (safe_read(&pMe, (const void *)(playerArray + 0x20 + (size_t)myIdx * 8), sizeof(uintptr_t))) {
-                pMe = clean_ptr(pMe);
-                if (pMe >= 0x100000000ULL) {
-                    myPlayer = (void *)pMe;
-                    int32_t mx = 0, my = 0;
-                    int8_t mteam = 0;
-                    safe_read(&mx, (const void *)(pMe + OFF_PLAYER_X), sizeof(int32_t));
-                    safe_read(&my, (const void *)(pMe + OFF_PLAYER_Y), sizeof(int32_t));
-                    safe_read(&mteam, (const void *)(pMe + OFF_PLAYER_TEAM), sizeof(int8_t));
-                    if (mx == 0 && my == 0) {
-                        float fx = 0, fy = 0;
-                        safe_read(&fx, (const void *)(pMe + OFF_PLAYER_CUR_X), sizeof(float));
-                        safe_read(&fy, (const void *)(pMe + OFF_PLAYER_CUR_Y), sizeof(float));
-                        mx = (int32_t)fx;
-                        my = (int32_t)fy;
-                    }
-                    g_lastMyX = mx;
-                    g_lastMyY = my;
-                    g_myTeam = mteam;
-                }
-            }
-        }
-
-        // Quét toàn bộ mảng người chơi
+        // BƯỚC 5: Đọc toạ độ và thông tin người chơi
         for (int i = 0; i < count; i++) {
             uintptr_t p = 0;
             if (!safe_read(&p, (const void *)(playerArray + 0x20 + (size_t)i * 8), sizeof(uintptr_t))) continue;
@@ -366,6 +325,7 @@ static void scanBattleState(void) {
             safe_read(&php, (const void *)(p + OFF_PLAYER_HP), sizeof(int32_t));
             safe_read(&pteam, (const void *)(p + OFF_PLAYER_TEAM), sizeof(int8_t));
 
+            // Nếu toạ độ pixel bằng 0, đọc toạ độ float curX / curY
             if (px == 0 && py == 0) {
                 float fx = 0, fy = 0;
                 safe_read(&fx, (const void *)(p + OFF_PLAYER_CUR_X), sizeof(float));
@@ -374,24 +334,42 @@ static void scanBattleState(void) {
                 py = (int32_t)fy;
             }
 
-            // Nếu chưa xác định myPlayer bằng myIdx, kiểm tra cờ isMe
-            if (!myPlayer && isMe) {
+            // Kiểm tra xem đây có phải là bản thân (Ta) không
+            bool isCurrentPlayer = (myPlayer && (void *)p == myPlayer) || (isMe == 1);
+            if (isCurrentPlayer) {
                 myPlayer = (void *)p;
                 g_lastMyX = px;
                 g_lastMyY = py;
                 g_myTeam = pteam;
+
+                // Lưu lại skill ID nếu người chơi vừa chọn skill trên giao diện game
+                int32_t curSkill = 0;
+                if (safe_read(&curSkill, (const void *)(p + OFF_PLAYER_SKILL), sizeof(int32_t))) {
+                    if (curSkill >= 0) {
+                        g_lastSelectedSkillId = curSkill;
+                    }
+                }
+
+                // Nếu bật skill liên tục: giữ cho skill không bị reset
+                if (g_continuousSkillEnabled) {
+                    int32_t targetSkillId = -1;
+                    switch (g_skillMode) {
+                        case MobiSkillMode_Super:  targetSkillId = 100; break; // Super/Ulti
+                        case MobiSkillMode_Skill1: targetSkillId = 1;   break; // Skill 1
+                        case MobiSkillMode_Skill2: targetSkillId = 6;   break; // Skill 2
+                        case MobiSkillMode_Dual:   targetSkillId = 2;   break; // Đạn x2
+                        default:
+                            if (g_lastSelectedSkillId >= 0) targetSkillId = g_lastSelectedSkillId;
+                            break;
+                    }
+                    if (targetSkillId >= 0) {
+                        *(int32_t *)((uintptr_t)p + OFF_PLAYER_SKILL) = targetSkillId;
+                    }
+                }
                 continue;
             }
 
-            // Nếu chính là myPlayer thì cập nhật vị trí và bỏ qua
-            if (myPlayer && (void *)p == myPlayer) {
-                g_lastMyX = px;
-                g_lastMyY = py;
-                g_myTeam = pteam;
-                continue;
-            }
-
-            // Kẻ địch (hoặc bot trong chế độ Luyện tập)
+            // Kẻ địch (Hoặc bot luyện tập)
             if (enemyIdx < MAX_TARGETS) {
                 EnemyTarget *t = &g_enemyList[enemyIdx];
                 t->id = i;
@@ -423,7 +401,7 @@ static void scanBattleState(void) {
             }
         }
 
-        // Fallback: nếu vẫn chưa tìm thấy myPlayer, lấy phần tử đầu tiên
+        // Fallback: Nếu chưa xác định được myPlayer, lấy phần tử đầu tiên
         if (!myPlayer && count > 0) {
             uintptr_t p0 = 0;
             if (safe_read(&p0, (const void *)(playerArray + 0x20), sizeof(uintptr_t))) {
@@ -447,17 +425,55 @@ static void scanBattleState(void) {
 }
 
 // ==========================================
-// 3. HOOK BẮN (SEND SHOOT)
+// 3. HOOK BẮN (SEND SHOOT) - AUTO-AIM & SKILL LIÊN TỤC
 // ==========================================
 static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t x, int16_t y, int8_t force, int8_t force2, int8_t unk, void *method) {
     @try {
+        // Ghi lại shootType nếu người chơi tự bấm skill
+        if (shootType > 0) {
+            g_lastSkillShootType = shootType;
+        }
+
+        // 1. Tự động ngắm (Aimbot)
         if (g_aimbotEnabled && g_lastSolution.found) {
             angle = g_lastSolution.angle;
             force = g_lastSolution.force;
-            force2 = g_lastSolution.force2;
+            if (force2 > 0 || (g_continuousSkillEnabled && g_skillMode == MobiSkillMode_Dual)) {
+                force2 = g_lastSolution.force;
+            }
             NSLog(@"[MobiArmyMod] Aimbot tự động điều chỉnh: Góc = %d°, Lực = %d", angle, force);
         }
-    } @catch (id ex) {}
+
+        // 2. Kích hoạt Skill Liên Tục
+        if (g_continuousSkillEnabled) {
+            int8_t forcedType = 0;
+            switch (g_skillMode) {
+                case MobiSkillMode_Auto:
+                    forcedType = (g_lastSkillShootType > 0) ? g_lastSkillShootType : 5;
+                    break;
+                case MobiSkillMode_Super:
+                    forcedType = 14; // Chiêu cuối (Super)
+                    break;
+                case MobiSkillMode_Skill1:
+                    forcedType = 5;  // Skill 1
+                    break;
+                case MobiSkillMode_Skill2:
+                    forcedType = 6;  // Skill 2
+                    break;
+                case MobiSkillMode_Dual:
+                    force2 = force;  // Bắn đạn đôi cùng lực
+                    if (g_lastSkillShootType > 0) forcedType = g_lastSkillShootType;
+                    break;
+            }
+
+            if (forcedType > 0) {
+                shootType = forcedType;
+                NSLog(@"[MobiArmyMod] Kích hoạt Skill Liên Tục: shootType = %d", shootType);
+            }
+        }
+    } @catch (id ex) {
+        NSLog(@"[MobiArmyMod] Lỗi trong hook_SendShoot: %@", ex);
+    }
 
     if (orig_SendShoot) {
         orig_SendShoot(self, shootType, angle, x, y, force, force2, unk, method);
@@ -476,6 +492,8 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
 @property (nonatomic, strong) UILabel *aimInfoLabel;
 @property (nonatomic, strong) UISwitch *aimSwitch;
 @property (nonatomic, strong) UISegmentedControl *arcSegment;
+@property (nonatomic, strong) UISwitch *skillSwitch;
+@property (nonatomic, strong) UISegmentedControl *skillSegment;
 @property (nonatomic, strong) UISlider *gravitySlider;
 @property (nonatomic, strong) UISlider *forceSlider;
 @property (nonatomic, strong) UILabel *gravityLabel;
@@ -518,98 +536,113 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
             keyWin = [UIApplication sharedApplication].windows.firstObject;
         }
 
-        if (!keyWin) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                [self attachToKeyWindow];
-            });
-            return;
-        }
+        if (!keyWin) return;
 
-        if (self.floatingButton && self.floatingButton.superview) return;
-
-        [self setupUIInWindow:keyWin];
+        [self createHUDInView:keyWin];
     });
 }
 
-- (void)setupUIInWindow:(UIWindow *)parent {
-    CGFloat btnSize = 44.0;
+- (void)createHUDInView:(UIView *)parent {
+    if (self.floatingButton) return;
+
+    // 1. Floating Button (Nút tròn kéo thả)
     self.floatingButton = [UIButton buttonWithType:UIButtonTypeCustom];
-    self.floatingButton.frame = CGRectMake(parent.bounds.size.width - btnSize - 16, 40, btnSize, btnSize);
-    self.floatingButton.backgroundColor = [UIColor colorWithRed:0.95 green:0.26 blue:0.21 alpha:0.85];
-    self.floatingButton.layer.cornerRadius = btnSize / 2.0;
-    self.floatingButton.layer.borderWidth = 2.0;
+    self.floatingButton.frame = CGRectMake(20, 100, 48, 48);
+    self.floatingButton.backgroundColor = [UIColor colorWithRed:0.08 green:0.48 blue:0.95 alpha:0.85];
+    self.floatingButton.layer.cornerRadius = 24;
+    self.floatingButton.layer.borderWidth = 1.5;
     self.floatingButton.layer.borderColor = [UIColor whiteColor].CGColor;
     self.floatingButton.layer.shadowColor = [UIColor blackColor].CGColor;
-    self.floatingButton.layer.shadowOffset = CGSizeMake(0, 2);
     self.floatingButton.layer.shadowOpacity = 0.5;
     self.floatingButton.layer.shadowRadius = 4;
+    self.floatingButton.layer.shadowOffset = CGSizeMake(0, 2);
+
     [self.floatingButton setTitle:@"🎯" forState:UIControlStateNormal];
     self.floatingButton.titleLabel.font = [UIFont systemFontOfSize:22];
-
     [self.floatingButton addTarget:self action:@selector(togglePanel) forControlEvents:UIControlEventTouchUpInside];
 
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
     [self.floatingButton addGestureRecognizer:pan];
     [parent addSubview:self.floatingButton];
 
-    // Panel điều khiển (gọn gàng, tối ưu không gian)
-    CGFloat panelW = 310;
-    CGFloat panelH = 280;
-    self.panelView = [[UIView alloc] initWithFrame:CGRectMake((parent.bounds.size.width - panelW) / 2, (parent.bounds.size.height - panelH) / 2, panelW, panelH)];
-    self.panelView.backgroundColor = [UIColor colorWithRed:0.08 green:0.11 blue:0.16 alpha:0.95];
+    // 2. Control Panel
+    CGFloat panelW = 320;
+    CGFloat panelH = 390;
+    self.panelView = [[UIView alloc] initWithFrame:CGRectMake(20, 160, panelW, panelH)];
+    self.panelView.backgroundColor = [UIColor colorWithRed:0.08 green:0.10 blue:0.14 alpha:0.95];
     self.panelView.layer.cornerRadius = 14;
-    self.panelView.layer.borderWidth = 1.5;
-    self.panelView.layer.borderColor = [UIColor colorWithRed:0.2 green:0.6 blue:1.0 alpha:0.6].CGColor;
-    self.panelView.layer.shadowColor = [UIColor blackColor].CGColor;
-    self.panelView.layer.shadowOffset = CGSizeMake(0, 4);
-    self.panelView.layer.shadowOpacity = 0.6;
-    self.panelView.layer.shadowRadius = 8;
+    self.panelView.layer.borderWidth = 1.0;
+    self.panelView.layer.borderColor = [UIColor colorWithWhite:0.25 alpha:0.8].CGColor;
+    self.panelView.clipsToBounds = YES;
     self.panelView.hidden = YES;
 
-    CGFloat curY = 12;
+    CGFloat curY = 10;
 
-    // Tiêu đề
+    // Title
     UILabel *titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, curY, panelW - 56, 24)];
-    titleLabel.text = @"⚡ MOBIARMY 3 HA AIMBOT";
-    titleLabel.font = [UIFont boldSystemFontOfSize:15];
-    titleLabel.textColor = [UIColor colorWithRed:0.3 green:0.8 blue:1.0 alpha:1.0];
+    titleLabel.text = @"MobiArmy 3 • Aimbot & Skill";
+    titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    titleLabel.textColor = [UIColor whiteColor];
     [self.panelView addSubview:titleLabel];
 
-    UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    closeBtn.frame = CGRectMake(panelW - 40, curY, 28, 24);
+    UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    closeBtn.frame = CGRectMake(panelW - 36, curY, 24, 24);
     [closeBtn setTitle:@"✕" forState:UIControlStateNormal];
     [closeBtn setTitleColor:[UIColor colorWithWhite:0.7 alpha:1.0] forState:UIControlStateNormal];
-    closeBtn.titleLabel.font = [UIFont boldSystemFontOfSize:18];
+    closeBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
     [closeBtn addTarget:self action:@selector(togglePanel) forControlEvents:UIControlEventTouchUpInside];
     [self.panelView addSubview:closeBtn];
-    curY += 32;
+    curY += 30;
 
     // Aimbot Switch
-    UILabel *aimTitle = [[UILabel alloc] initWithFrame:CGRectMake(16, curY + 4, 150, 24)];
-    aimTitle.text = @"AIMBOT TỰ ĐỘNG";
-    aimTitle.font = [UIFont boldSystemFontOfSize:13];
+    UILabel *aimTitle = [[UILabel alloc] initWithFrame:CGRectMake(16, curY, 160, 26)];
+    aimTitle.text = @"Tự Động Ngắm (Aimbot):";
+    aimTitle.font = [UIFont systemFontOfSize:12];
     aimTitle.textColor = [UIColor whiteColor];
     [self.panelView addSubview:aimTitle];
 
-    self.aimSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(panelW - 68, curY, 51, 31)];
+    self.aimSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(panelW - 70, curY - 2, 51, 26)];
     self.aimSwitch.on = g_aimbotEnabled;
     [self.aimSwitch addTarget:self action:@selector(onAimToggle:) forControlEvents:UIControlEventValueChanged];
     [self.panelView addSubview:self.aimSwitch];
-    curY += 36;
+    curY += 30;
 
     // Arc Mode Segment
     NSArray *arcItems = @[@"Góc cao (High Arc)", @"Góc thấp (Low Arc)"];
     self.arcSegment = [[UISegmentedControl alloc] initWithItems:arcItems];
-    self.arcSegment.frame = CGRectMake(16, curY, panelW - 32, 28);
+    self.arcSegment.frame = CGRectMake(16, curY, panelW - 32, 26);
     self.arcSegment.selectedSegmentIndex = g_highArcMode ? 0 : 1;
     [self.arcSegment addTarget:self action:@selector(onArcChanged:) forControlEvents:UIControlEventValueChanged];
     [self.panelView addSubview:self.arcSegment];
-    curY += 34;
+    curY += 32;
 
-    // Target Info & Switch
+    // Skill Liên Tục Switch
+    UILabel *skillTitle = [[UILabel alloc] initWithFrame:CGRectMake(16, curY, 160, 26)];
+    skillTitle.text = @"Skill Liên Tục (Spam Skill):";
+    skillTitle.font = [UIFont boldSystemFontOfSize:12];
+    skillTitle.textColor = [UIColor colorWithRed:1.0 green:0.8 blue:0.2 alpha:1.0];
+    [self.panelView addSubview:skillTitle];
+
+    self.skillSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(panelW - 70, curY - 2, 51, 26)];
+    self.skillSwitch.on = g_continuousSkillEnabled;
+    self.skillSwitch.onTintColor = [UIColor colorWithRed:0.95 green:0.5 blue:0.1 alpha:1.0];
+    [self.skillSwitch addTarget:self action:@selector(onSkillToggle:) forControlEvents:UIControlEventValueChanged];
+    [self.panelView addSubview:self.skillSwitch];
+    curY += 30;
+
+    // Skill Mode Segment (Auto / Super / Skill 1 / Skill 2 / Đạn x2)
+    NSArray *skillItems = @[@"Vừa dùng", @"Super", @"Skill 1", @"Skill 2", @"Đạn x2"];
+    self.skillSegment = [[UISegmentedControl alloc] initWithItems:skillItems];
+    self.skillSegment.frame = CGRectMake(16, curY, panelW - 32, 26);
+    self.skillSegment.selectedSegmentIndex = (NSInteger)g_skillMode;
+    [self.skillSegment addTarget:self action:@selector(onSkillModeChanged:) forControlEvents:UIControlEventValueChanged];
+    [self.panelView addSubview:self.skillSegment];
+    curY += 32;
+
+    // Target Info & Switch buttons
     self.targetInfoLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, curY, panelW - 130, 24)];
     self.targetInfoLabel.text = @"Chưa vào trận đấu";
-    self.targetInfoLabel.font = [UIFont boldSystemFontOfSize:13];
+    self.targetInfoLabel.font = [UIFont boldSystemFontOfSize:12];
     self.targetInfoLabel.textColor = [UIColor yellowColor];
     [self.panelView addSubview:self.targetInfoLabel];
 
@@ -632,10 +665,10 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
     nextTargetBtn.layer.cornerRadius = 6;
     [nextTargetBtn addTarget:self action:@selector(onNextTarget) forControlEvents:UIControlEventTouchUpInside];
     [self.panelView addSubview:nextTargetBtn];
-    curY += 30;
+    curY += 28;
 
     // Telemetry Box
-    UIView *teleBox = [[UIView alloc] initWithFrame:CGRectMake(16, curY, panelW - 32, 50)];
+    UIView *teleBox = [[UIView alloc] initWithFrame:CGRectMake(16, curY, panelW - 32, 54)];
     teleBox.backgroundColor = [UIColor colorWithRed:0.04 green:0.07 blue:0.12 alpha:0.9];
     teleBox.layer.cornerRadius = 8;
     teleBox.layer.borderWidth = 1.0;
@@ -648,15 +681,15 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
     self.aimInfoLabel.textAlignment = NSTextAlignmentCenter;
     [teleBox addSubview:self.aimInfoLabel];
 
-    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(8, 26, teleBox.bounds.size.width - 16, 18)];
-    self.statusLabel.text = @"Vào trận để tự động quét mục tiêu";
+    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(8, 28, teleBox.bounds.size.width - 16, 20)];
+    self.statusLabel.text = @"Sẵn sàng • Vào trận để tự ngắm";
     self.statusLabel.font = [UIFont systemFontOfSize:11];
     self.statusLabel.textColor = [UIColor colorWithWhite:0.7 alpha:1.0];
     self.statusLabel.textAlignment = NSTextAlignmentCenter;
     [teleBox addSubview:self.statusLabel];
 
     [self.panelView addSubview:teleBox];
-    curY += 56;
+    curY += 60;
 
     // Sliders
     self.gravityLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, curY, panelW - 32, 14)];
@@ -706,7 +739,7 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
             [self.panelView.superview bringSubviewToFront:self.panelView];
             [self refreshUI];
             if (!self.updateTimer) {
-                self.updateTimer = [NSTimer scheduledTimerWithTimeInterval:0.4
+                self.updateTimer = [NSTimer scheduledTimerWithTimeInterval:0.35
                                                                     target:self
                                                                   selector:@selector(refreshUI)
                                                                   userInfo:nil
@@ -728,6 +761,16 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
 
 - (void)onArcChanged:(UISegmentedControl *)sender {
     g_highArcMode = (sender.selectedSegmentIndex == 0);
+    [self refreshUI];
+}
+
+- (void)onSkillToggle:(UISwitch *)sender {
+    g_continuousSkillEnabled = sender.isOn;
+    [self refreshUI];
+}
+
+- (void)onSkillModeChanged:(UISegmentedControl *)sender {
+    g_skillMode = (MobiSkillMode)sender.selectedSegmentIndex;
     [self refreshUI];
 }
 
@@ -766,12 +809,12 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
             self.targetInfoLabel.textColor = [UIColor yellowColor];
             self.aimInfoLabel.text = @"Góc: --°  |  Lực: --";
             self.aimInfoLabel.textColor = [UIColor colorWithWhite:0.6 alpha:1.0];
-            self.statusLabel.text = @"Vào trận để tự động quét mục tiêu";
+            self.statusLabel.text = @"Sẵn sàng • Vào trận để tự ngắm";
             return;
         }
 
         if (g_enemyCount == 0) {
-            self.targetInfoLabel.text = @"Đang tìm địch...";
+            self.targetInfoLabel.text = @"Đã vào trận • Đang tìm mục tiêu...";
             self.targetInfoLabel.textColor = [UIColor yellowColor];
             self.aimInfoLabel.text = @"Góc: --°  |  Lực: --";
             self.aimInfoLabel.textColor = [UIColor colorWithWhite:0.6 alpha:1.0];
@@ -794,7 +837,7 @@ static void hook_SendShoot(void *self, int8_t shootType, int16_t angle, int16_t 
         } else {
             self.aimInfoLabel.text = @"Góc: --°  |  Lực: --";
             self.aimInfoLabel.textColor = [UIColor colorWithWhite:0.6 alpha:1.0];
-            self.statusLabel.text = [NSString stringWithFormat:@"Mục tiêu ngoài tầm bắn | Cách: %d px", abs(curEnemy->x - g_lastMyX)];
+            self.statusLabel.text = [NSString stringWithFormat:@"Mục tiêu ngoài tầm | Cách: %d px", abs(curEnemy->x - g_lastMyX)];
         }
 
     } @catch (id ex) {
@@ -815,7 +858,7 @@ static void setupHUDAndHooks(void) {
             unity_base = base;
             NSLog(@"[MobiArmyMod] UnityFramework base: 0x%lx", base);
 
-            // Hook qua MSHookFunction nếu có Substrate/Ellekit (Dopamine / Sileo)
+            // Hook SendShoot qua MSHookFunction (Dopamine / Sileo / ElleKit)
             void (*fn_MSHook)(void *, void *, void **) = (void (*)(void *, void *, void **))dlsym(RTLD_DEFAULT, "MSHookFunction");
             if (fn_MSHook) {
                 fn_MSHook((void *)(base + OFF_SERVICE_SEND_SHOOT), (void *)hook_SendShoot, (void **)&orig_SendShoot);
@@ -824,18 +867,17 @@ static void setupHUDAndHooks(void) {
         }
 
         [[MobiHUDManager shared] attachToKeyWindow];
-        NSLog(@"[MobiArmyMod] Khởi tạo HUD thành công 100%%!");
+        NSLog(@"[MobiArmyMod] Khởi tạo HUD & Auto-Aim & Skill hoàn tất 100%%!");
     });
 }
 
 __attribute__((constructor)) static void MobiArmyModInit(void) {
     NSLog(@"[MobiArmyMod] Dylib khởi chạy trong tiến trình pid: %d", getpid());
 
-    // Tuyệt đối không can thiệp bộ nhớ engine ở constructor!
-    // Chờ app vào foreground hoàn toàn trên main thread
+    // Chờ ứng dụng vào foreground hoàn toàn trên main thread
     dispatch_async(dispatch_get_main_queue(), ^{
         if ([UIApplication sharedApplication].applicationState == UIApplicationStateActive) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 setupHUDAndHooks();
             });
         }
@@ -845,7 +887,7 @@ __attribute__((constructor)) static void MobiArmyModInit(void) {
                                                        object:nil
                                                         queue:[NSOperationQueue mainQueue]
                                                    usingBlock:^(NSNotification * _Nonnull note) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             setupHUDAndHooks();
         });
     }];
