@@ -22,25 +22,28 @@ jobs:
           cp -R sdks-master/iPhoneOS*.sdk "$THEOS/sdks/" || true
           echo "THEOS=$THEOS" >> "$GITHUB_ENV"
 
-      - name: Install ldid
-        run: brew install ldid || true
+      - name: Install ldid & dpkg
+        run: |
+          brew install ldid dpkg || true
 
-      - name: Build dylib
+      - name: Build Rootless DEB Package
         run: |
           set -e
           export PATH="$THEOS/bin:$PATH"
           make clean || true
-          make FINALPACKAGE=1 messages=yes
-
-      - name: Show output
-        run: |
-          find .theos/obj -name '*.dylib' -print -exec file {} \;
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless messages=yes
 
       - name: Prepare Artifacts
         run: |
           mkdir -p dist
-          find .theos/obj -name '*.dylib' -exec cp {} dist/ \;
+          # Copy .deb packages
+          cp packages/*.deb dist/ 2>/dev/null || true
+          # Find REAL MH_DYLIB from staged directory (exclude dSYM debug symbols)
+          find .theos/_ -name '*.dylib' -not -path '*.dSYM*' -exec cp {} dist/ \;
           cp MobiArmyMod.plist dist/ 2>/dev/null || true
+          echo "=== DIST FILES ==="
+          ls -la dist/
+          file dist/*
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
