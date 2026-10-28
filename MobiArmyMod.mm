@@ -104,13 +104,10 @@ static uintptr_t find_unity_base(void) {
 
 // Strip PAC trên ARM64E (A16 Bionic / iPhone 14 Pro Max)
 static inline uintptr_t clean_ptr(uintptr_t ptr) {
-#if defined(__arm64__) || defined(__arm64e__)
-    register uintptr_t x30 __asm__("x30") = ptr;
-    __asm__("xpaci x30" : "+r"(x30));
-    return x30 & 0x0000007FFFFFFFFFULL;
-#else
-    return ptr;
-#endif
+    // Trên iOS 64-bit, không gian địa chỉ ứng dụng luôn nằm ở < 0x8000000000
+    // Các bit PAC (Pointer Authentication) và tag nằm ở các bit cao 40..63
+    // Mặt nạ bit loại bỏ hoàn toàn PAC mà không cần lệnh inline asm xpaci (tương thích mọi compiler)
+    return ptr & 0x0000007FFFFFFFFFULL;
 }
 
 static inline bool is_map_renderer_call(uintptr_t ra) {
