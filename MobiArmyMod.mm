@@ -42,8 +42,12 @@ typedef struct Il2CppDomain Il2CppDomain;
 typedef struct Il2CppAssembly Il2CppAssembly;
 typedef struct Il2CppImage Il2CppImage;
 typedef struct Il2CppClass Il2CppClass;
-typedef struct Il2CppObject Il2CppObject;
 typedef struct Il2CppString Il2CppString;
+
+typedef struct Il2CppObject {
+    void *klass;
+    void *monitor;
+} Il2CppObject;
 
 typedef struct MethodInfo {
     void *methodPointer;
@@ -93,19 +97,32 @@ static const uintptr_t kHeightSites[] = { 0x194194, 0x194874, 0x194aa4 };
 #define OFF_PLAYER_CUR_X        0x280  // Single (float)
 #define OFF_PLAYER_CUR_Y        0x284  // Single (float)
 
-// ---------- Function Pointers ----------
-static Il2CppDomain *(*p_domain_get)(void);
-static Il2CppAssembly **(*p_domain_get_assemblies)(Il2CppDomain *, size_t *);
-static Il2CppImage *(*p_assembly_get_image)(Il2CppAssembly *);
-static const char *(*p_image_get_name)(Il2CppImage *);
-static Il2CppClass *(*p_class_from_name)(const Il2CppImage *, const char *, const char *);
-static MethodInfo *(*p_class_get_method_from_name)(Il2CppClass *, const char *, int);
-static void *(*p_thread_attach)(Il2CppDomain *);
+// ---------- Typedefs cho Function Pointers ----------
+typedef Il2CppDomain *(*domain_get_t)(void);
+typedef Il2CppAssembly **(*domain_get_assemblies_t)(Il2CppDomain *, size_t *);
+typedef Il2CppImage *(*assembly_get_image_t)(Il2CppAssembly *);
+typedef const char *(*image_get_name_t)(Il2CppImage *);
+typedef Il2CppClass *(*class_from_name_t)(const Il2CppImage *, const char *, const char *);
+typedef MethodInfo *(*class_get_method_from_name_t)(Il2CppClass *, const char *, int);
+typedef void *(*thread_attach_t)(Il2CppDomain *);
 
-static int (*orig_get_width)(const MethodInfo *);
-static int (*orig_get_height)(const MethodInfo *);
-static void (*orig_SendShoot)(void *self, int8_t shootType, int16_t angle, int16_t x, int16_t y, int8_t force, int8_t force2, int8_t unk, const MethodInfo *method);
-static void *(*p_GetMyPlayer)(void);
+typedef int (*get_width_t)(const MethodInfo *);
+typedef int (*get_height_t)(const MethodInfo *);
+typedef void (*send_shoot_t)(void *, int8_t, int16_t, int16_t, int16_t, int8_t, int8_t, int8_t, const MethodInfo *);
+typedef void *(*get_my_player_t)(void);
+
+static domain_get_t p_domain_get;
+static domain_get_assemblies_t p_domain_get_assemblies;
+static assembly_get_image_t p_assembly_get_image;
+static image_get_name_t p_image_get_name;
+static class_from_name_t p_class_from_name;
+static class_get_method_from_name_t p_class_get_method_from_name;
+static thread_attach_t p_thread_attach;
+
+static get_width_t orig_get_width;
+static get_height_t orig_get_height;
+static send_shoot_t orig_SendShoot;
+static get_my_player_t p_GetMyPlayer;
 
 static uintptr_t unity_base = 0;
 static Il2CppImage *csharp_image = NULL;
@@ -673,13 +690,13 @@ static void install_mod_once(void) {
     if (!base) return;
 
     unity_base = base;
-    p_domain_get = (void *)(base + OFF_DOMAIN_GET);
-    p_domain_get_assemblies = (void *)(base + OFF_DOMAIN_GET_ASSEMBLIES);
-    p_assembly_get_image = (void *)(base + OFF_ASSEMBLY_GET_IMAGE);
-    p_image_get_name = (void *)(base + OFF_IMAGE_GET_NAME);
-    p_class_from_name = (void *)(base + OFF_CLASS_FROM_NAME);
-    p_class_get_method_from_name = (void *)(base + OFF_CLASS_GET_METHOD_FROM_NAME);
-    p_thread_attach = (void *)(base + OFF_THREAD_ATTACH);
+    p_domain_get = (domain_get_t)(base + OFF_DOMAIN_GET);
+    p_domain_get_assemblies = (domain_get_assemblies_t)(base + OFF_DOMAIN_GET_ASSEMBLIES);
+    p_assembly_get_image = (assembly_get_image_t)(base + OFF_ASSEMBLY_GET_IMAGE);
+    p_image_get_name = (image_get_name_t)(base + OFF_IMAGE_GET_NAME);
+    p_class_from_name = (class_from_name_t)(base + OFF_CLASS_FROM_NAME);
+    p_class_get_method_from_name = (class_get_method_from_name_t)(base + OFF_CLASS_GET_METHOD_FROM_NAME);
+    p_thread_attach = (thread_attach_t)(base + OFF_THREAD_ATTACH);
 
     Il2CppDomain *domain = p_domain_get();
     if (!domain) return;
@@ -705,8 +722,8 @@ static void install_mod_once(void) {
             MethodInfo *mw = p_class_get_method_from_name(screen, "get_width", 0);
             MethodInfo *mh = p_class_get_method_from_name(screen, "get_height", 0);
             if (mw && mh && mw->methodPointer && mh->methodPointer) {
-                orig_get_width = (int (*)(const MethodInfo *))mw->methodPointer;
-                orig_get_height = (int (*)(const MethodInfo *))mh->methodPointer;
+                orig_get_width = (get_width_t)mw->methodPointer;
+                orig_get_height = (get_height_t)mh->methodPointer;
                 patch_method(mw, (void *)hook_get_width);
                 patch_method(mh, (void *)hook_get_height);
                 NSLog(@"[MobiArmyMod] Zoom hooks installed successfully!");
@@ -717,14 +734,14 @@ static void install_mod_once(void) {
     // 2. Tìm BattleManager & MyPlayer
     if (csharp_image) {
         battle_manager_class = p_class_from_name(csharp_image, "lllIIlllllllIlIIIIllIIIIIlllIIIlIlIl", "llIlIlIIlllllllllllIlllIIllIlllIIIlIIIlIIllIllIIIIIIlIlIIIlIlIIlIIlIllIl");
-        p_GetMyPlayer = (void *(*)(void))(base + OFF_BATTLE_GET_MY_PLAYER);
+        p_GetMyPlayer = (get_my_player_t)(base + OFF_BATTLE_GET_MY_PLAYER);
 
         // 3. Hook hàm bắn SendShoot
         Il2CppClass *serviceClass = p_class_from_name(csharp_image, "llIIIIIIlIlllIIllIlllIlIlIllIlllIIII", "lIIlIlIIlIllIIlIIlIIIIllllIIlIIllIllIIIlIIlIIlIIIllIIIIIIllIllIlIIlllIIl");
         if (serviceClass) {
             MethodInfo *shootMethod = p_class_get_method_from_name(serviceClass, "lllIIIIIllIllIIlIIIIlIlIIlIIllIIlIlIIllIIlIlIIIIIIlIllIlllIllIIIIlllllII", 7);
             if (shootMethod && shootMethod->methodPointer) {
-                orig_SendShoot = (void (*)(void *, int8_t, int16_t, int16_t, int16_t, int8_t, int8_t, int8_t, const MethodInfo *))shootMethod->methodPointer;
+                orig_SendShoot = (send_shoot_t)shootMethod->methodPointer;
                 patch_method(shootMethod, (void *)hook_SendShoot);
                 NSLog(@"[MobiArmyMod] Aimbot SendShoot hook installed successfully!");
             }
